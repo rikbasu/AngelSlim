@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from .draft_model_factory import DraftModelConfig, create_draft_model
+from .gemma4_dflare import Gemma4DFlareConfig, Gemma4DFlareDraftModel
 from .llama_eagle3 import CosyVoice3Eagle3LlamaForCausalLM, Eagle3LlamaForCausalLM
 from .qwen_dflare import QwenDFlareDraftModel
 from .qwen_dflash import QwenDFlashDraftModel
@@ -20,6 +21,8 @@ from .qwen_dflash import QwenDFlashDraftModel
 __all__ = [
     "create_draft_model",
     "DraftModelConfig",
+    "Gemma4DFlareConfig",
+    "Gemma4DFlareDraftModel",
     "Eagle3LlamaForCausalLM",
     "CosyVoice3Eagle3LlamaForCausalLM",
     "QwenDFlashDraftModel",

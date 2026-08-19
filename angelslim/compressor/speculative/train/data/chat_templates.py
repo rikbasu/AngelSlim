@@ -32,6 +32,7 @@ class ChatTemplateType(Enum):
     QWEN3 = "qwen3"
     HUNYUAN = "hunyuan"
     QWEN3_VL = "qwen3_vl"
+    GEMMA4 = "gemma4"
     HUNYUAN_7B = "hunyuan_7b"
     HUNYUAN_VL = "hunyuan_vl"
 
@@ -45,6 +46,7 @@ CHAT_TEMPLATE_TYPE_MAPPING = {
     "hunyuan": ChatTemplateType.HUNYUAN,
     "hunyuan_7b": ChatTemplateType.HUNYUAN_7B,
     "qwen3_vl": ChatTemplateType.QWEN3_VL,
+    "gemma4": ChatTemplateType.GEMMA4,
     "hunyuan_vl": ChatTemplateType.HUNYUAN_VL,
 }
 
@@ -155,6 +157,11 @@ class ChatTemplateManager:
                         ),
                     }
                 ],
+            ),
+            ChatTemplateType.GEMMA4: ChatTemplate(
+                user_header="",
+                assistant_header="",
+                system_prompt="You are a helpful assistant.",
             ),
             ChatTemplateType.QWEN2_5_VL: ChatTemplate(
                 user_header="<|im_start|>user\n",

@@ -267,7 +267,7 @@ def parse_args():
         "--method",
         type=str,
         default="eagle3",
-        choices=["ngram", "eagle", "eagle3", "mtp", "ar"],
+        choices=["ngram", "eagle", "eagle3", "dflare", "mtp", "ar"],
     )
     parser.add_argument("--num_spec_tokens", type=int, default=2)
     parser.add_argument("--prompt_lookup_max", type=int, default=5)
@@ -386,6 +386,7 @@ def run_benchmark(args, dataset_name, llm, tokenizer, sampling_params):
         "dataset": dataset_name,
         "model_dir": args.target_model,
         "eagle_dir": args.draft_model if args.method in ["eagle", "eagle3"] else None,
+        "draft_dir": args.draft_model if args.method == "dflare" else None,
         "method": args.method,
         "num_spec_tokens": args.num_spec_tokens,
         "num_prompts": args.num_prompts,
@@ -471,6 +472,7 @@ def calculate_average_stats(all_stats, args):
         "dataset": "AVERAGE",
         "model_dir": args.target_model,
         "eagle_dir": args.draft_model if args.method in ["eagle", "eagle3"] else None,
+        "draft_dir": args.draft_model if args.method == "dflare" else None,
         "method": args.method,
         "num_spec_tokens": args.num_spec_tokens,
         "num_prompts": args.num_prompts,
@@ -542,12 +544,14 @@ def main(args):
     tokenizer = AutoTokenizer.from_pretrained(model_dir)
 
     # Configure speculative decoding
-    if args.method == "eagle" or args.method == "eagle3":
+    if args.method in ("eagle", "eagle3", "dflare"):
         eagle_dir = args.draft_model
         if args.method == "eagle" and eagle_dir is None:
             eagle_dir = "yuhuili/EAGLE-LLaMA3.1-Instruct-8B"
         elif args.method == "eagle3" and eagle_dir is None:
             eagle_dir = "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B"
+        elif args.method == "dflare" and eagle_dir is None:
+            raise ValueError("--draft_model is required for dflare")
 
         speculative_config = {
             "method": args.method,

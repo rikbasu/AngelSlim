@@ -808,6 +808,74 @@ class TransformersBackend(BaseBackend):
         }
 
 
+class Gemma4TransformersBackend(BaseBackend):
+    """Transformers backend for the Gemma-4 conditional-generation model."""
+
+    def load_model(self) -> None:
+        from transformers import AutoModelForImageTextToText, AutoProcessor
+
+        device = decide_device_for_distributed()
+        model_kwargs = {
+            "dtype": torch.bfloat16,
+            "device_map": device,
+            "trust_remote_code": True,
+        }
+        model_kwargs.update(self.kwargs)
+        self.model = AutoModelForImageTextToText.from_pretrained(
+            self.model_path,
+            **model_kwargs,
+        )
+        for parameter in self.model.parameters():
+            parameter.requires_grad = False
+        self.model.eval()
+        self.tokenizer = AutoProcessor.from_pretrained(
+            self.model_path,
+            trust_remote_code=True,
+        )
+
+    def _build_model_inputs(self, input_ids, attention_mask, kwargs):
+        values = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "pixel_values": kwargs.get("pixel_values"),
+            "pixel_values_videos": kwargs.get("pixel_values_videos"),
+            "input_features": kwargs.get("input_features"),
+            "input_features_mask": kwargs.get("input_features_mask"),
+            "position_ids": kwargs.get("input_position_ids"),
+            "image_position_ids": kwargs.get("image_position_ids"),
+            "video_position_ids": kwargs.get("video_position_ids"),
+            "mm_token_type_ids": kwargs.get("mm_token_type_ids"),
+        }
+        return {key: value for key, value in values.items() if value is not None}
+
+    def _forward(self, input_ids, attention_mask, kwargs):
+        with torch.no_grad():
+            return self.model(
+                **self._build_model_inputs(input_ids, attention_mask, kwargs),
+                output_hidden_states=True,
+                use_cache=False,
+            )
+
+    def get_hidden_states_and_logits(self, input_ids, attention_mask=None, **kwargs):
+        outputs = self._forward(input_ids, attention_mask, kwargs)
+        aux_hidden_states = self._extract_auxiliary_hidden_states(
+            outputs.hidden_states,
+            kwargs.get("aux_hidden_states_layer_ids"),
+        )
+        return aux_hidden_states, outputs.logits.to(input_ids.device)
+
+    def get_aux_and_target_hiddens(self, input_ids, attention_mask=None, **kwargs):
+        outputs = self._forward(input_ids, attention_mask, kwargs)
+        aux_hidden_states = self._extract_auxiliary_hidden_states(
+            outputs.hidden_states,
+            kwargs.get("aux_hidden_states_layer_ids"),
+        )
+        return {
+            "hidden_states": aux_hidden_states,
+            "target_hiddens": outputs.hidden_states[-1],
+        }
+
+
 class VLMTransformersBackend(BaseBackend):
     """VLM HuggingFace Transformers backend"""
 
@@ -856,6 +924,23 @@ class VLMTransformersBackend(BaseBackend):
                 self.model_path,
                 trust_remote_code=True,
             )
+        elif self.target_model_type == "gemma4":
+            from transformers import AutoModelForImageTextToText, AutoProcessor
+
+            device = decide_device_for_distributed()
+            print_with_rank(f"Loading model to device: {device}")
+            model_kwargs = self._prepare_model_kwargs(device)
+            self.model = AutoModelForImageTextToText.from_pretrained(
+                self.model_path,
+                **model_kwargs,
+            )
+            for param in self.model.parameters():
+                param.requires_grad = False
+            self.model.eval()
+            self.tokenizer = AutoProcessor.from_pretrained(
+                self.model_path,
+                trust_remote_code=True,
+            )
         else:
             raise ValueError(f"Unsupported target model type: {self.target_model_type}")
 
@@ -894,6 +979,36 @@ class VLMTransformersBackend(BaseBackend):
         Returns:
             Tuple of (concatenated_hidden_states, logits)
         """
+        if self.target_model_type == "gemma4":
+            model_inputs = {
+                key: value
+                for key, value in {
+                    "input_ids": input_ids,
+                    "attention_mask": attention_mask,
+                    "pixel_values": kwargs.get("pixel_values"),
+                    "pixel_values_videos": kwargs.get("pixel_values_videos"),
+                    "input_features": kwargs.get("input_features"),
+                    "input_features_mask": kwargs.get("input_features_mask"),
+                    "position_ids": kwargs.get("input_position_ids"),
+                    "image_position_ids": kwargs.get("image_position_ids"),
+                    "video_position_ids": kwargs.get("video_position_ids"),
+                    "mm_token_type_ids": kwargs.get("mm_token_type_ids"),
+                }.items()
+                if value is not None
+            }
+            with torch.no_grad():
+                outputs = self.model(
+                    **model_inputs,
+                    output_hidden_states=True,
+                    use_cache=False,
+                )
+            aux_layer_ids = kwargs.get("aux_hidden_states_layer_ids")
+            hidden_states = self._extract_auxiliary_hidden_states(
+                outputs.hidden_states,
+                aux_layer_ids,
+            )
+            return hidden_states, outputs.logits.to(input_ids.device)
+
         inputs_embeds_list, position_ids_list = [], []
 
         def hook(module, args, kwargs):
@@ -2059,6 +2174,7 @@ class TargetModelWrapper:
     BACKENDS = {
         ("hf", "LLM"): TransformersBackend,
         ("hf", "VLM"): VLMTransformersBackend,
+        ("hf", "Gemma4"): Gemma4TransformersBackend,
         ("hf", "TTS"): TTSTransformersBackend,
         ("hf", "Audio"): AudioTransformersBackend,
         ("vllm", "LLM"): VLLMBackend,

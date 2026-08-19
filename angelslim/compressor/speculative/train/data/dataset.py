@@ -178,7 +178,9 @@ class DatasetManager:
         min_loss_tokens = None
         if self.data_args.modal_type == "DFlash":
             block_size = getattr(self.data_args, "block_size", 16)
-            min_loss_tokens = 2 * block_size
+            min_loss_tokens = getattr(self.data_args, "min_loss_tokens", None)
+            if min_loss_tokens is None:
+                min_loss_tokens = 2 * block_size
 
         # Create training dataset
         train_dataset = None

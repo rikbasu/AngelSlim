@@ -97,14 +97,26 @@ class TargetEmbeddingsAndHead(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
+        text_config = (
+            config.get_text_config()
+            if hasattr(config, "get_text_config")
+            else getattr(config, "text_config", config)
+        )
+        vocab_size = getattr(text_config, "vocab_size", getattr(config, "vocab_size", None))
+        hidden_size = getattr(text_config, "hidden_size", getattr(config, "hidden_size", None))
+        pad_token_id = getattr(text_config, "pad_token_id", None)
 
         self.embed_tokens = nn.Embedding(
-            config.vocab_size,
-            config.hidden_size,
-            padding_idx=getattr(config, "pad_token_id", None),
+            vocab_size,
+            hidden_size,
+            padding_idx=pad_token_id,
         )
+        self.embedding_scale = (
+            hidden_size**0.5 if getattr(config, "model_type", None) == "gemma4" else 1.0
+        )
+        self.logit_softcap = getattr(text_config, "final_logit_softcapping", None)
 
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
 
     @classmethod
     def from_pretrained(
@@ -121,7 +133,12 @@ class TargetEmbeddingsAndHead(nn.Module):
         instance = cls(config)
 
         if embed_key is None:
-            embed_key = "model.embed_tokens.weight"
+            model_type = getattr(config, "model_type", None)
+            embed_key = (
+                "model.language_model.embed_tokens.weight"
+                if model_type == "gemma4"
+                else "model.embed_tokens.weight"
+            )
         if lm_head_key is None:
             lm_head_key = "lm_head.weight"
 
@@ -490,7 +507,11 @@ class OnlineDFlashTrainer(Eagle3Trainer):
         )
 
         # Extract DFlash-specific config
-        dflash_config = getattr(draft_model_config, "dflash_config", {}) or {}
+        dflash_config = (
+            getattr(draft_model_config, "dflash_config", None)
+            or getattr(draft_model_config, "dflare_config", None)
+            or {}
+        )
         self.block_size = getattr(draft_model_config, "block_size", 16)
         self.num_anchors = getattr(draft_model_config, "num_anchors", 512)
         self.loss_decay_gamma = getattr(draft_model_config, "loss_decay_gamma", None)
@@ -541,6 +562,8 @@ class OnlineDFlashTrainer(Eagle3Trainer):
             )
             self.target_lm_head = target_components.lm_head
             self.target_embed_tokens = target_components.embed_tokens
+            self.target_embedding_scale = target_components.embedding_scale
+            self.target_logit_softcap = target_components.logit_softcap
         else:
             raise ValueError(
                 "target_model_name_or_path must be set in draft_model_config "
@@ -798,7 +821,7 @@ class OnlineDFlashTrainer(Eagle3Trainer):
             torch.tensor(self.mask_token_id, dtype=torch.long, device=device),
         )
 
-        return self.target_embed_tokens(noise_ids)
+        return self.target_embed_tokens(noise_ids) * self.target_embedding_scale
 
     def _compute_dflash_loss_and_accuracy(
         self,
@@ -864,6 +887,9 @@ class OnlineDFlashTrainer(Eagle3Trainer):
 
         output_hidden = output_hidden.to(self.target_lm_head.weight.dtype)
         logits = self.target_lm_head(output_hidden)
+        if self.target_logit_softcap is not None:
+            logits = logits / self.target_logit_softcap
+            logits = torch.tanh(logits) * self.target_logit_softcap
 
         # ── 6. Labels: position k in block predicts token at (anchor + k) ────
         bs = self.block_size

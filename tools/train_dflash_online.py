@@ -90,7 +90,7 @@ def parse_args():
     model_group.add_argument(
         "--embed_weight_key",
         type=str,
-        default="model.embed_tokens.weight",
+        default=None,
         help="Key for embedding weights in model config",
     )
     model_group.add_argument(
@@ -178,6 +178,15 @@ def parse_args():
         type=int,
         default=None,
         help="Number of max samples for data preprocessing",
+    )
+    data_group.add_argument(
+        "--min_loss_tokens",
+        type=int,
+        default=None,
+        help=(
+            "Minimum assistant-label tokens per DFlash/DFlare example. "
+            "Defaults to twice the block size."
+        ),
     )
     data_group.add_argument(
         "--shuffle_seed", type=int, default=42, help="Random seed for shuffling dataset"
@@ -412,7 +421,11 @@ def train():
     if args.draft_arch is not None:
         arch_map = {
             "dflash": "QwenDFlashDraftModel",
-            "dflare": "QwenDFlareDraftModel",
+            "dflare": (
+                "Gemma4DFlareDraftModel"
+                if target_model_type == "gemma4"
+                else "QwenDFlareDraftModel"
+            ),
         }
         new_arch = arch_map[args.draft_arch]
         rank0_print(
@@ -424,7 +437,8 @@ def train():
     # Inject DFlash-specific config into the draft model config
     # so the trainer can access them
     draft_model_config.target_model_name_or_path = args.target_model_name_or_path
-    draft_model_config.embed_weight_key = args.embed_weight_key
+    if args.embed_weight_key is not None:
+        draft_model_config.embed_weight_key = args.embed_weight_key
     draft_model_config.trust_remote_code = args.trust_remote_code
 
     # Override DFlash params from CLI if specified
@@ -456,7 +470,11 @@ def train():
     target_model = create_target_model(
         backend=args.target_backend,
         model_path=args.target_model_name_or_path,
-        modal_type="LLM",  # DFlash uses standard LLM target model
+        modal_type=(
+            "Gemma4"
+            if target_model_type == "gemma4"
+            else "LLM"
+        ),
         torch_dtype=torch_dtype,
         trust_remote_code=args.trust_remote_code,
         target_model_type=target_model_type,
@@ -464,7 +482,11 @@ def train():
     rank0_print("Target model loaded successfully")
 
     # Configure target model to capture the right layers for DFlash
-    dflash_config = getattr(draft_model_config, "dflash_config", {}) or {}
+    dflash_config = (
+        getattr(draft_model_config, "dflash_config", None)
+        or getattr(draft_model_config, "dflare_config", None)
+        or {}
+    )
     target_layer_ids = dflash_config.get("target_layer_ids", None)
     if target_layer_ids is not None:
         # Set aux_hidden_states_layer_ids to match DFlash's target_layer_ids
@@ -586,6 +608,8 @@ def train():
     else:
         rank0_print("Starting DFlash training...")
         trainer.train()
+    trainer.save_model(training_args.output_dir)
+    rank0_print(f"Saved final draft model to {training_args.output_dir}")
     rank0_print("DFlash training completed!")
 
 

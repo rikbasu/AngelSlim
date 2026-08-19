@@ -90,6 +90,74 @@ class OnlineLLMDatasetBuilder(OnlineDatasetBuilder):
         return super()._process_single_conversation(conversation_data)
 
 
+@DatasetBuilderFactory.register("online", "LLM", "gemma4")
+class OnlineGemma4DatasetBuilder(OnlineLLMDatasetBuilder):
+    """Text-only Gemma-4 builder using the model's native chat template.
+
+    Gemma-4's template does not expose a Transformers assistant-token mask.
+    Render once, tokenize with offsets, and mark the exact assistant content
+    spans as labels.
+    """
+
+    def _process_single_conversation(self, conversation_data):
+        if not conversation_data or not isinstance(conversation_data, list):
+            return None
+
+        messages = []
+        for message in conversation_data:
+            role = message.get("role")
+            content = self._normalize_content(message.get("content", ""))
+            if role in {"system", "user", "assistant"} and content:
+                messages.append({"role": role, "content": content})
+        if not messages:
+            return None
+
+        processor = self.tokenizer
+        tokenizer = getattr(processor, "tokenizer", processor)
+        rendered = processor.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=False,
+        )
+        encoding = tokenizer(
+            rendered,
+            add_special_tokens=False,
+            return_offsets_mapping=True,
+            max_length=self.max_length,
+            truncation=True,
+            padding=False,
+        )
+        input_ids = torch.tensor(encoding["input_ids"], dtype=torch.long)
+        offsets = encoding["offset_mapping"]
+        loss_mask = torch.zeros_like(input_ids)
+
+        search_start = 0
+        assistant_spans = []
+        for message in messages:
+            if message["role"] != "assistant":
+                continue
+            content = message["content"]
+            start = rendered.find(content, search_start)
+            if start < 0:
+                raise ValueError("Assistant content was not found in rendered Gemma template")
+            end = start + len(content)
+            assistant_spans.append((start, end))
+            search_start = end
+
+        for token_index, (token_start, token_end) in enumerate(offsets):
+            if any(
+                token_end > span_start and token_start < span_end
+                for span_start, span_end in assistant_spans
+            ):
+                loss_mask[token_index] = 1
+
+        return {
+            "input_ids": input_ids[None, :],
+            "attention_mask": torch.ones_like(input_ids)[None, :],
+            "loss_mask": loss_mask[None, :],
+        }
+
+
 @DatasetBuilderFactory.register("online", "VLM", "qwen2_5_vl")
 @DatasetBuilderFactory.register("online", "VLM", "qwen3_vl")
 class OnlineVLMDatasetBuilder(OnlineDatasetBuilder):
