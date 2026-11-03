@@ -31,6 +31,11 @@ from safetensors import safe_open
 from torch import nn
 from transformers import AutoConfig
 
+from .dflash_position_metrics import (
+    dflash_position_metric_counts,
+    empty_dflash_position_counts,
+    finalize_dflash_position_metrics,
+)
 from .eagle3_trainer import Eagle3Trainer
 from .trainer_factory import Eagle3TrainerFactory
 
@@ -44,12 +49,91 @@ except ImportError:
     create_block_mask = None
 
 
+def acceptance_aware_position_weights(
+    token_nll: torch.Tensor,
+    valid_mask: torch.Tensor,
+    alpha: float = 0.5,
+) -> torch.Tensor:
+    """Compute D-PACE weights for expected accepted-prefix length.
+
+    D-PACE smooths detached target-token probabilities only inside the
+    position weights: q_tilde = (1 - alpha) * q + alpha. This prevents
+    cumulative products, and therefore later-position weights, from
+    vanishing. The token cross-entropy itself remains unsmoothed.
+    """
+    if not 0.0 <= alpha <= 1.0:
+        raise ValueError(f"D-PACE alpha must be in [0, 1], got {alpha}")
+
+    valid = valid_mask.bool()
+    correct_prob = torch.exp(-token_nll.detach()).clamp_(min=1e-6, max=1.0)
+    smoothed_prob = (1.0 - alpha) * correct_prob + alpha
+    step_prob = torch.where(valid, smoothed_prob, torch.ones_like(smoothed_prob))
+    prefix_survival = torch.cumprod(step_prob, dim=-1) * valid.float()
+    downstream_value = torch.flip(
+        torch.cumsum(torch.flip(prefix_survival, dims=(-1,)), dim=-1),
+        dims=(-1,),
+    )
+    normalizer = (downstream_value * valid.float()).sum() / valid.float().sum().clamp_min(
+        1.0
+    )
+    return torch.where(
+        valid,
+        downstream_value / normalizer.clamp_min(1e-6),
+        torch.zeros_like(downstream_value),
+    )
+
+
+def front_distillation_kl(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    valid_mask: torch.Tensor,
+    num_positions: int,
+    temperature: float = 1.0,
+    position_weights: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Forward KL from a B16 teacher on front positions only."""
+    if temperature <= 0:
+        raise ValueError(
+            f"front distillation temperature must be positive, got {temperature}"
+        )
+    limit = min(
+        int(num_positions) + 1,
+        student_logits.shape[-2],
+        teacher_logits.shape[-2],
+    )
+    if limit <= 1:
+        return student_logits.sum() * 0.0
+
+    student = student_logits[..., 1:limit, :].float() / temperature
+    teacher = teacher_logits[..., 1:limit, :].float() / temperature
+    teacher_log_probs = F.log_softmax(teacher, dim=-1)
+    teacher_probs = teacher_log_probs.exp()
+    student_log_probs = F.log_softmax(student, dim=-1)
+    per_position = (
+        teacher_probs * (teacher_log_probs - student_log_probs)
+    ).sum(dim=-1) * (temperature**2)
+
+    weights = valid_mask[..., 1:limit].float()
+    if position_weights is not None:
+        weights = weights * position_weights[..., 1:limit].float()
+    return (per_position * weights).sum() / weights.sum().clamp_min(1e-6)
+
+
+def freeze_front_teacher_model(model: nn.Module) -> nn.Module:
+    """Put a front-distillation teacher in inference-only mode."""
+    model.eval()
+    model.requires_grad_(False)
+    return model
+
+
 def create_dflash_block_mask(
     anchor_positions: torch.Tensor,
     block_keep_mask: torch.Tensor,
     S: int,
     block_size: int,
     device: torch.device,
+    causal_within_block: bool = False,
+    attention_backend: str = "flex_attention",
 ):
     """Construct Flex Attention BlockMask for DFlash training.
 
@@ -75,6 +159,10 @@ def create_dflash_block_mask(
         is_draft = kv_idx >= S
         kv_block_id = (kv_idx - S) // block_size
         mask_draft = is_draft & (q_block_id == kv_block_id)
+        if causal_within_block:
+            q_offset = q_idx % block_size
+            kv_offset = (kv_idx - S) % block_size
+            mask_draft = mask_draft & (kv_offset <= q_offset)
 
         is_valid_block = block_keep_mask[b, q_block_id]
         return (mask_context | mask_draft) & is_valid_block
@@ -82,6 +170,30 @@ def create_dflash_block_mask(
     B, N = anchor_positions.shape
     Q_LEN = N * block_size
     KV_LEN = S + N * block_size
+
+    if attention_backend != "flex_attention":
+        q_idx = torch.arange(Q_LEN, device=device)
+        kv_idx = torch.arange(KV_LEN, device=device)
+        q_block_id = q_idx // block_size
+        anchors = anchor_positions[:, q_block_id]
+
+        is_context = kv_idx < S
+        mask_context = is_context[None, None, :] & (
+            kv_idx[None, None, :] < anchors[:, :, None]
+        )
+        is_draft = kv_idx >= S
+        kv_block_id = (kv_idx - S).clamp_min(0) // block_size
+        mask_draft = is_draft[None, None, :] & (
+            q_block_id[None, :, None] == kv_block_id[None, None, :]
+        )
+        if causal_within_block:
+            q_offset = q_idx % block_size
+            kv_offset = (kv_idx - S).clamp_min(0) % block_size
+            mask_draft &= (
+                kv_offset[None, None, :] <= q_offset[None, :, None]
+            )
+        valid = block_keep_mask[:, q_block_id, None]
+        return ((mask_context | mask_draft) & valid).unsqueeze(1)
 
     return create_block_mask(
         dflash_mask_mod, B=B, H=None, Q_LEN=Q_LEN, KV_LEN=KV_LEN, device=device
@@ -260,11 +372,28 @@ class _FP32StateAdamW(torch.optim.Optimizer):
         with torch.no_grad():
             for group in self.param_groups:
                 for p in group["params"]:
-                    state = self.state[p]
-                    state["step"] = torch.tensor(0.0)
-                    state["exp_avg"] = torch.zeros_like(p, dtype=torch.float32)
-                    state["exp_avg_sq"] = torch.zeros_like(p, dtype=torch.float32)
-                    state["master_param"] = p.data.detach().clone().to(torch.float32)
+                    self._initialize_param_state(p)
+
+    def _initialize_param_state(self, param: torch.Tensor) -> dict:
+        """Initialize state for original or FSDP-rewrapped parameters."""
+        state = self.state[param]
+        if "exp_avg" not in state:
+            state["step"] = torch.tensor(0.0)
+            state["exp_avg"] = torch.zeros_like(param, dtype=torch.float32)
+            state["exp_avg_sq"] = torch.zeros_like(param, dtype=torch.float32)
+            state["master_param"] = param.data.detach().clone().to(torch.float32)
+        return state
+
+    def _prune_stale_param_state(self) -> None:
+        """Drop state keyed by parameters replaced during FSDP2 wrapping."""
+        active_params = {
+            param
+            for group in self.param_groups
+            for param in group["params"]
+        }
+        for param in list(self.state):
+            if isinstance(param, torch.Tensor) and param not in active_params:
+                del self.state[param]
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -274,6 +403,8 @@ class _FP32StateAdamW(torch.optim.Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
+        self._prune_stale_param_state()
+
         # Phase 1: Cast all bf16 grads to fp32 (kept temporarily in state).
         all_fp32_grads = []
         for group in self.param_groups:
@@ -281,7 +412,7 @@ class _FP32StateAdamW(torch.optim.Optimizer):
                 if p.grad is None:
                     continue
 
-                state = self.state[p]
+                state = self._initialize_param_state(p)
 
                 # Ensure states are fp32 (handles resume from checkpoint).
                 if state["exp_avg"].dtype != torch.float32:
@@ -319,7 +450,7 @@ class _FP32StateAdamW(torch.optim.Optimizer):
                 if p.grad is None:
                     continue
 
-                state = self.state[p]
+                state = self._initialize_param_state(p)
                 grad = state.pop("_fp32_grad")
 
                 exp_avg = state["exp_avg"]
@@ -350,6 +481,10 @@ class _FP32StateAdamW(torch.optim.Optimizer):
                 p.grad = None
 
         return loss
+
+    def state_dict(self):
+        self._prune_stale_param_state()
+        return super().state_dict()
 
 
 class _FP32MasterWeightOptimizer(torch.optim.Optimizer):
@@ -487,6 +622,7 @@ class OnlineDFlashTrainer(Eagle3Trainer):
         target_model: nn.Module,
         length: int,
         draft_model_config: Dict[str, Any],
+        front_teacher_model: nn.Module | None = None,
         **kwargs,
     ):
         """
@@ -500,8 +636,22 @@ class OnlineDFlashTrainer(Eagle3Trainer):
                 must contain dflash-specific fields
             **kwargs: Additional arguments passed to parent Trainer
         """
+        train_tail_adapters_only = bool(
+            getattr(draft_model_config, "train_tail_adapters_only", False)
+        )
+        if train_tail_adapters_only:
+            trainable = []
+            for name, parameter in draft_model.named_parameters():
+                parameter.requires_grad_(name.startswith("tail_adapter_"))
+                if parameter.requires_grad:
+                    trainable.append(name)
+            if not trainable:
+                raise ValueError(
+                    "train_tail_adapters_only requires configured tail adapters"
+                )
         super().__init__(draft_model=draft_model, length=length, **kwargs)
         self.target_model = target_model
+        self.train_tail_adapters_only = train_tail_adapters_only
         self._aux_hidden_states_layer_ids = getattr(
             draft_model_config, "aux_hidden_states_layer_ids", None
         )
@@ -521,6 +671,56 @@ class OnlineDFlashTrainer(Eagle3Trainer):
         self.gamma_warmup = getattr(draft_model_config, "gamma_warmup", False)
         self._gamma_step = getattr(draft_model_config, "gamma_warmup_step", 0.5)
         self.attention_backend = getattr(draft_model_config, "attention_backend", "flex_attention")
+        # Fraction of anchors relocated onto the rejection-point distribution
+        # that serving actually visits. Costs one extra no-grad forward.
+        self.hard_anchor_fraction = float(
+            getattr(draft_model_config, "hard_anchor_fraction", 0.0) or 0.0
+        )
+        self.max_train_positions = getattr(
+            draft_model_config,
+            "max_train_positions",
+            None,
+        )
+        self.horizon_boundary = getattr(
+            draft_model_config,
+            "horizon_boundary",
+            None,
+        )
+        self.horizon_tail_weight = float(
+            getattr(draft_model_config, "horizon_tail_weight", 1.0) or 1.0
+        )
+        self.acceptance_aware_loss = bool(
+            getattr(draft_model_config, "acceptance_aware_loss", False)
+        )
+        self.dpace_alpha = float(
+            getattr(draft_model_config, "dpace_alpha", 0.5)
+        )
+        if not 0.0 <= self.dpace_alpha <= 1.0:
+            raise ValueError(
+                f"dpace_alpha must be in [0, 1], got {self.dpace_alpha}"
+            )
+        self.ar_aux_weight = float(
+            getattr(draft_model_config, "ar_aux_weight", 0.0) or 0.0
+        )
+        self.front_distill_weight = float(
+            getattr(draft_model_config, "front_distill_weight", 0.0) or 0.0
+        )
+        self.front_distill_positions = int(
+            getattr(draft_model_config, "front_distill_positions", 15) or 15
+        )
+        self.front_distill_temperature = float(
+            getattr(draft_model_config, "front_distill_temperature", 1.0) or 1.0
+        )
+        self.front_teacher_block_size = int(
+            getattr(draft_model_config, "front_teacher_block_size", 16) or 16
+        )
+        self.front_teacher_model = front_teacher_model
+        if self.front_distill_weight > 0 and self.front_teacher_model is None:
+            raise ValueError(
+                "front_teacher_model is required when front_distill_weight > 0"
+            )
+        if self.front_teacher_model is not None:
+            freeze_front_teacher_model(self.front_teacher_model)
         self.mask_token_id = dflash_config.get(
             "mask_token_id",
             getattr(draft_model_config, "mask_token_id", None),
@@ -738,12 +938,29 @@ class OnlineDFlashTrainer(Eagle3Trainer):
         input_ids = inputs["input_ids"]
         attention_mask = inputs["attention_mask"]
         loss_mask = inputs["loss_mask"]
+        target_kwargs = {
+            key: inputs[key]
+            for key in (
+                "pixel_values",
+                "pixel_values_videos",
+                "image_grid_thw",
+                "video_grid_thw",
+                "input_features",
+                "input_features_mask",
+                "input_position_ids",
+                "image_position_ids",
+                "mm_token_type_ids",
+                "raw_images",
+            )
+            if key in inputs and inputs[key] is not None
+        }
 
         # Get hidden states from target model
-        hidden_states, _ = self.target_model.get_hidden_states_and_logits(
+        hidden_states = self.target_model.get_hidden_states_only(
             input_ids=input_ids,
             attention_mask=attention_mask,
             aux_hidden_states_layer_ids=self._aux_hidden_states_layer_ids,
+            **target_kwargs,
         )
 
         return {
@@ -751,29 +968,58 @@ class OnlineDFlashTrainer(Eagle3Trainer):
             "hidden_states": hidden_states,
             "loss_mask": loss_mask,
             "attention_mask": attention_mask,
+            "token_position_ids": self._serving_position_ids(
+                input_ids, attention_mask, target_kwargs
+            ),
         }
+
+    def _serving_position_ids(self, input_ids, attention_mask, target_kwargs):
+        """Position ids the vLLM drafter actually reads.
+
+        Qwen3.5 M-RoPE is ``(3, batch, seq)``: time, height, and width.
+        Image tokens share a time id; height and width separate them.
+        """
+        mm_token_type_ids = target_kwargs.get("mm_token_type_ids")
+        if mm_token_type_ids is None:
+            return None
+        backend = getattr(self.target_model, "backend", None)
+        outer = getattr(backend, "model", None)
+        inner = getattr(outer, "model", None)
+        if inner is None or not hasattr(inner, "get_rope_index"):
+            return None
+        rope_positions, _ = inner.get_rope_index(
+            input_ids,
+            mm_token_type_ids,
+            image_grid_thw=target_kwargs.get("image_grid_thw"),
+            video_grid_thw=target_kwargs.get("video_grid_thw"),
+            attention_mask=attention_mask,
+        )
+        return rope_positions.to(device=input_ids.device, dtype=torch.long)
 
     def _sample_anchor_positions(
         self, seq_len: int, loss_mask: torch.Tensor, device: torch.device
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Randomly sample anchor positions per sample; returns (anchors, keep_mask).
 
-        Returns (None, None) when the batch has no valid anchors (too-short or
-        loss_mask-empty sequences), which is handled gracefully in forward().
+        Always returns tensors so every rank runs the same FSDP draft forward.
+        Rows with no eligible anchors keep a dummy position 0 with keep_mask
+        False. A single eligible position is enough: the block still has up to
+        ``block_size-1`` prediction targets. Requiring two used to skip the
+        hard-tail serving anchor when the 16-token window sat at EOS.
         """
         bs = self.block_size
         bsz = loss_mask.shape[0]
         max_anchor = max(seq_len - bs, 0)
+        if os.environ.get("ANGELSLIM_DFLASH_ANCHOR_TO_END") == "1":
+            # Serving anchors inside the answer's last block_size tokens too
+            # (e.g. "status: CONTINUE<|im_end|>"); labels past the end are
+            # masked by valid_label_mask.
+            max_anchor = max(seq_len - 2, 0)
 
         valid = loss_mask[:, : max_anchor + 1] > 0.5
         valid_counts = valid.sum(dim=1)
         max_valid = int(valid_counts.max().item())
-
-        # Need at least 2 valid positions (anchor + at least one prediction target)
-        if max_valid <= 1:
-            return None, None
-
-        max_n = min(self.num_anchors, max_valid - 1)
+        max_n = min(self.num_anchors, max(max_valid, 1))
 
         indices = torch.arange(max_anchor + 1, device=device).unsqueeze(0).expand(bsz, -1)
         masked_indices = torch.where(valid, indices, torch.tensor(seq_len + 1, device=device))
@@ -792,18 +1038,176 @@ class OnlineDFlashTrainer(Eagle3Trainer):
 
         return anchors, keep_mask
 
-    def _create_position_ids(self, anchor_positions: torch.Tensor) -> torch.Tensor:
+    def _create_position_ids(
+        self,
+        anchor_positions: torch.Tensor,
+        block_size: int | None = None,
+    ) -> torch.Tensor:
         """Create absolute position IDs for parallel draft blocks."""
         bsz, n_blocks = anchor_positions.shape
         device = anchor_positions.device
-        offsets = torch.arange(self.block_size, device=device).view(1, 1, -1)
+        bs = self.block_size if block_size is None else int(block_size)
+        offsets = torch.arange(bs, device=device).view(1, 1, -1)
         pos_ids = anchor_positions.unsqueeze(-1) + offsets
         return pos_ids.view(bsz, -1)
 
-    def _create_noise_embed(self, input_ids, anchor_positions, block_keep_mask):
+    def _block_logits(
+        self,
+        model: nn.Module,
+        input_ids: torch.Tensor,
+        hidden_states: torch.Tensor,
+        anchor_positions: torch.Tensor,
+        block_keep_mask: torch.Tensor,
+        autoregressive_prefix: bool = False,
+        block_size: int | None = None,
+        token_position_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Run the draft over the sampled blocks and return vocabulary logits."""
+        bsz, seq_len = input_ids.shape
+        device = input_ids.device
+        bs = self.block_size if block_size is None else int(block_size)
+
+        noise_embedding = self._create_noise_embed(
+            input_ids,
+            anchor_positions,
+            block_keep_mask,
+            autoregressive_prefix=autoregressive_prefix,
+            block_size=bs,
+        )
+        if token_position_ids is None:
+            context_position_ids = (
+                torch.arange(seq_len, device=device).unsqueeze(0).expand(bsz, -1)
+            )
+            draft_anchor_positions = anchor_positions
+            draft_position_ids = self._create_position_ids(
+                draft_anchor_positions,
+                block_size=bs,
+            )
+            full_position_ids = torch.cat([context_position_ids, draft_position_ids], dim=1)
+        elif token_position_ids.dim() == 3 and token_position_ids.shape[0] == 3:
+            context_position_ids = token_position_ids.to(device=device, dtype=torch.long)
+            anchor_index = anchor_positions.clamp(max=seq_len - 1)
+            batch_index = torch.arange(bsz, device=device)[:, None]
+            anchor_mrope = context_position_ids[:, batch_index, anchor_index]
+            offsets = torch.arange(bs, device=device).view(1, 1, 1, -1)
+            draft_position_ids = (anchor_mrope.unsqueeze(-1) + offsets).reshape(3, bsz, -1)
+            full_position_ids = torch.cat([context_position_ids, draft_position_ids], dim=-1)
+        else:
+            context_position_ids = token_position_ids.to(device=device, dtype=torch.long)
+            draft_anchor_positions = torch.gather(
+                context_position_ids,
+                1,
+                anchor_positions.clamp(max=seq_len - 1),
+            )
+            draft_position_ids = self._create_position_ids(
+                draft_anchor_positions,
+                block_size=bs,
+            )
+            full_position_ids = torch.cat([context_position_ids, draft_position_ids], dim=1)
+
+        dflash_attn_mask = create_dflash_block_mask(
+            anchor_positions=anchor_positions,
+            block_keep_mask=block_keep_mask,
+            S=seq_len,
+            block_size=bs,
+            device=device,
+            causal_within_block=autoregressive_prefix,
+            attention_backend=self.attention_backend,
+        )
+
+        model_dtype = next(model.parameters()).dtype
+        output_hidden = model(
+            noise_embedding=noise_embedding.to(model_dtype),
+            target_hidden=hidden_states.to(model_dtype),
+            attention_mask=dflash_attn_mask,
+            position_ids=full_position_ids,
+        )
+
+        output_hidden = output_hidden.to(self.target_lm_head.weight.dtype)
+        logits = self.target_lm_head(output_hidden)
+        if self.target_logit_softcap is not None:
+            logits = logits / self.target_logit_softcap
+            logits = torch.tanh(logits) * self.target_logit_softcap
+        return logits.view(bsz, anchor_positions.size(1), bs, -1)
+
+    def _rejection_point_anchors(
+        self,
+        model: nn.Module,
+        input_ids: torch.Tensor,
+        hidden_states: torch.Tensor,
+        anchor_positions: torch.Tensor,
+        block_keep_mask: torch.Tensor,
+        token_position_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Move each anchor to the position where its block would be rejected.
+
+        Uniformly sampled anchors do not match serving. At serving time only a
+        request's first block starts at a freely chosen anchor; every later block
+        starts exactly where the previous block was rejected, which is a token
+        the draft just failed to predict. Measured on the 60-prompt set, blocks
+        at a free anchor commit 6.84 tokens while blocks at a rejection anchor
+        commit 3.27, and rejection anchors are 95% of steps. Training on
+        uniform anchors therefore optimizes a distribution the model almost
+        never sees.
+
+        One extra no-grad forward locates each block's first mismatch and
+        returns the anchor serving would visit next.
+        """
+        seq_len = input_ids.shape[1]
+        bs = self.block_size
+        device = input_ids.device
+
+        with torch.no_grad():
+            logits = self._block_logits(
+                model,
+                input_ids,
+                hidden_states,
+                anchor_positions,
+                block_keep_mask,
+                token_position_ids=token_position_ids,
+            )
+            predictions = logits.argmax(dim=-1)  # [B, N, bs]
+
+            offsets = torch.arange(bs, device=device).view(1, 1, -1)
+            label_indices = (anchor_positions.unsqueeze(-1) + offsets).clamp(
+                max=seq_len - 1
+            )
+            targets = torch.gather(
+                input_ids.unsqueeze(1).expand(-1, anchor_positions.size(1), -1),
+                dim=2,
+                index=label_indices,
+            )
+
+            mismatch = predictions != targets
+            # Block position 0 carries the anchor token itself and is never a
+            # prediction, so it can never be the rejection point.
+            mismatch[..., 0] = False
+            any_mismatch = mismatch.any(dim=-1)
+            # argmax on a bool tensor returns the first True index.
+            first_mismatch = mismatch.float().argmax(dim=-1)
+            # A fully accepted block advances the anchor past the whole block.
+            first_mismatch = torch.where(
+                any_mismatch,
+                first_mismatch,
+                torch.full_like(first_mismatch, bs - 1),
+            )
+            moved = anchor_positions + first_mismatch
+            max_anchor = max(seq_len - bs, 0)
+            moved = moved.clamp(max=max_anchor)
+        # Padding blocks keep their original anchor; their loss weight is zero.
+        return torch.where(block_keep_mask, moved, anchor_positions)
+
+    def _create_noise_embed(
+        self,
+        input_ids,
+        anchor_positions,
+        block_keep_mask,
+        autoregressive_prefix: bool = False,
+        block_size: int | None = None,
+    ):
         bsz, seq_len = input_ids.shape
         n = anchor_positions.shape[1]
-        bs = self.block_size
+        bs = self.block_size if block_size is None else int(block_size)
         device = input_ids.device
 
         noise_ids = torch.full((bsz, n * bs), self.mask_token_id, dtype=torch.long, device=device)
@@ -820,6 +1224,29 @@ class OnlineDFlashTrainer(Eagle3Trainer):
             anchor_tokens,
             torch.tensor(self.mask_token_id, dtype=torch.long, device=device),
         )
+        if autoregressive_prefix:
+            offsets = torch.arange(1, bs, device=device).view(1, 1, -1)
+            predecessor_indices = (
+                anchor_positions.unsqueeze(-1) + offsets - 1
+            ).clamp(max=seq_len - 1)
+            predecessor_tokens = torch.gather(
+                input_ids.unsqueeze(1).expand(-1, n, -1),
+                dim=2,
+                index=predecessor_indices,
+            )
+            block_offsets = (
+                torch.arange(n, device=device).view(1, n, 1) * bs + offsets
+            ).expand(bsz, -1, -1)
+            valid = block_keep_mask.unsqueeze(-1).expand_as(predecessor_tokens)
+            noise_ids.scatter_(
+                1,
+                block_offsets.reshape(bsz, -1),
+                torch.where(
+                    valid,
+                    predecessor_tokens,
+                    torch.full_like(predecessor_tokens, self.mask_token_id),
+                ).reshape(bsz, -1),
+            )
 
         return self.target_embed_tokens(noise_ids) * self.target_embedding_scale
 
@@ -829,6 +1256,8 @@ class OnlineDFlashTrainer(Eagle3Trainer):
         input_ids: torch.Tensor,
         hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
+        return_position_metrics: bool = False,
+        token_position_ids: torch.Tensor | None = None,
     ):
         """Core DFlash block-parallel loss logic (shared by train + eval).
 
@@ -841,7 +1270,8 @@ class OnlineDFlashTrainer(Eagle3Trainer):
           6. Compute accuracy (no-decay mask).
 
         Returns:
-            (loss, accuracy) — both scalar tensors.
+            ``(loss, accuracy)`` by default. When ``return_position_metrics``
+            is true, also returns additive per-position metric counts.
         """
         bsz, seq_len = input_ids.shape
         device = input_ids.device
@@ -853,43 +1283,47 @@ class OnlineDFlashTrainer(Eagle3Trainer):
 
         # No valid anchors → return zero loss connected to model params (DDP-safe)
         if anchor_positions is None:
-            zero_loss = sum(p.sum() * 0.0 for p in model.parameters() if p.requires_grad)
-            return zero_loss, torch.tensor(0.0, device=device)
+            # Keep every parameter connected so FSDP sees a consistent gradient
+            # structure across ranks. Reduce each local shard in FP32:
+            # flattening an uneven global DTensor is unsupported, and a global
+            # reduction here would deadlock when only one rank has a short row.
+            zero_loss = sum(
+                (p.to_local() if hasattr(p, "to_local") else p).float().sum() * 0.0
+                for p in model.parameters()
+                if p.requires_grad and p.numel()
+            )
+            result = (zero_loss, torch.tensor(0.0, device=device))
+            if return_position_metrics:
+                return (*result, empty_dflash_position_counts(self.block_size, device))
+            return result
 
-        # ── 2. Noise embedding ────────────────────────────────────────────────
-        noise_embedding = self._create_noise_embed(input_ids, anchor_positions, block_keep_mask)
+        # ── 2. Optionally move anchors onto the serving distribution ─────────
+        if self.hard_anchor_fraction > 0.0:
+            moved = self._rejection_point_anchors(
+                model,
+                input_ids,
+                hidden_states,
+                anchor_positions,
+                block_keep_mask,
+                token_position_ids=token_position_ids,
+            )
+            if self.hard_anchor_fraction >= 1.0:
+                anchor_positions = moved
+            else:
+                take = torch.rand_like(moved, dtype=torch.float) < (
+                    self.hard_anchor_fraction
+                )
+                anchor_positions = torch.where(take, moved, anchor_positions)
 
-        # ── 3. Position IDs  [B, S + N*block_size] ───────────────────────────
-        context_position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(bsz, -1)
-        draft_position_ids = self._create_position_ids(anchor_positions)
-        full_position_ids = torch.cat([context_position_ids, draft_position_ids], dim=1)
-
-        # ── 4. Attention mask (DFlash BlockMask) ─────────────────────────────
-        dflash_attn_mask = create_dflash_block_mask(
-            anchor_positions=anchor_positions,
-            block_keep_mask=block_keep_mask,
-            S=seq_len,
-            block_size=self.block_size,
-            device=device,
+        # ── 3. Draft model forward → logits  [B, N, bs, vocab] ──────────────
+        logits = self._block_logits(
+            model,
+            input_ids,
+            hidden_states,
+            anchor_positions,
+            block_keep_mask,
+            token_position_ids=token_position_ids,
         )
-
-        # ── 5. Draft model forward → logits  [B, N*bs, vocab] ────────────────
-        model_dtype = next(model.parameters()).dtype
-        noise_embedding = noise_embedding.to(model_dtype)
-        hidden_states = hidden_states.to(model_dtype)
-
-        output_hidden = model(
-            noise_embedding=noise_embedding,
-            target_hidden=hidden_states,
-            attention_mask=dflash_attn_mask,
-            position_ids=full_position_ids,
-        )
-
-        output_hidden = output_hidden.to(self.target_lm_head.weight.dtype)
-        logits = self.target_lm_head(output_hidden)
-        if self.target_logit_softcap is not None:
-            logits = logits / self.target_logit_softcap
-            logits = torch.tanh(logits) * self.target_logit_softcap
 
         # ── 6. Labels: position k in block predicts token at (anchor + k) ────
         bs = self.block_size
@@ -910,6 +1344,10 @@ class OnlineDFlashTrainer(Eagle3Trainer):
 
         pos_in_block = torch.arange(bs, device=device).view(1, 1, -1)
         weight_mask = weight_mask * (pos_in_block > 0).float()  # skip pos 0 (anchor)
+        if self.max_train_positions is not None:
+            weight_mask = weight_mask * (
+                pos_in_block <= int(self.max_train_positions)
+            ).float()
 
         gathered_loss_mask = torch.gather(
             loss_mask.unsqueeze(1).expand(-1, anchor_positions.size(1), -1),
@@ -920,7 +1358,16 @@ class OnlineDFlashTrainer(Eagle3Trainer):
 
         binary_eval_mask = weight_mask.view(-1)  # no decay, used for accuracy
 
-        # ── 8. Exponential decay: exp(-(k-1)/γ), k=1 gets weight 1.0 ─────────
+        # ── 8. Optional block-horizon and exponential position weights ────────
+        if self.horizon_boundary is not None and self.horizon_tail_weight != 1.0:
+            horizon_weights = torch.where(
+                pos_in_block >= int(self.horizon_boundary),
+                torch.tensor(self.horizon_tail_weight, device=device),
+                torch.tensor(1.0, device=device),
+            )
+            weight_mask = weight_mask * horizon_weights
+
+        # Exponential decay: exp(-(k-1)/γ), k=1 gets weight 1.0.
         if self.loss_decay_gamma is not None and self.loss_decay_gamma > 0:
             k = torch.arange(bs, device=device).view(1, 1, -1)
             decay = torch.exp(-(k - 1).clamp(min=0).float() / self.loss_decay_gamma)
@@ -932,7 +1379,61 @@ class OnlineDFlashTrainer(Eagle3Trainer):
         flat_weights = weight_mask.view(-1)
 
         loss_per_token = F.cross_entropy(flat_logits, flat_targets, reduction="none")
+        dynamic_weights = None
+        if self.acceptance_aware_loss:
+            dynamic_weights = acceptance_aware_position_weights(
+                loss_per_token.view_as(target_ids),
+                binary_eval_mask.view_as(target_ids),
+                alpha=self.dpace_alpha,
+            )
+            flat_weights = flat_weights * dynamic_weights.view(-1)
         loss = (loss_per_token * flat_weights).sum() / (flat_weights.sum() + 1e-6)
+        if self.ar_aux_weight > 0:
+            ar_logits = self._block_logits(
+                model,
+                input_ids,
+                hidden_states,
+                anchor_positions,
+                block_keep_mask,
+                autoregressive_prefix=True,
+                token_position_ids=token_position_ids,
+            )
+            ar_loss_per_token = F.cross_entropy(
+                ar_logits.view(-1, ar_logits.size(-1)),
+                flat_targets,
+                reduction="none",
+            )
+            ar_loss = (ar_loss_per_token * flat_weights).sum() / (
+                flat_weights.sum() + 1e-6
+            )
+            loss = loss + self.ar_aux_weight * ar_loss
+        if self.front_distill_weight > 0:
+            assert self.front_teacher_model is not None
+            teacher = self.front_teacher_model
+            teacher_param = next(teacher.parameters())
+            model_dtype = next(model.parameters()).dtype
+            if teacher_param.device != device or teacher_param.dtype != model_dtype:
+                teacher.to(device=device, dtype=model_dtype)
+            teacher.eval()
+            with torch.no_grad():
+                teacher_logits = self._block_logits(
+                    teacher,
+                    input_ids,
+                    hidden_states,
+                    anchor_positions,
+                    block_keep_mask,
+                    block_size=self.front_teacher_block_size,
+                    token_position_ids=token_position_ids,
+                )
+            front_loss = front_distillation_kl(
+                logits,
+                teacher_logits,
+                binary_eval_mask.view_as(target_ids),
+                num_positions=self.front_distill_positions,
+                temperature=self.front_distill_temperature,
+                position_weights=dynamic_weights,
+            )
+            loss = loss + self.front_distill_weight * front_loss
 
         # ── 10. Accuracy (no gradient) ────────────────────────────────────────
         with torch.no_grad():
@@ -940,6 +1441,15 @@ class OnlineDFlashTrainer(Eagle3Trainer):
             correct = (pred_ids == flat_targets) & (binary_eval_mask > 0.5)
             accuracy = correct.sum().float() / (binary_eval_mask.sum() + 1e-6)
 
+        if return_position_metrics:
+            with torch.no_grad():
+                position_counts = dflash_position_metric_counts(
+                    predictions=pred_ids.view_as(target_ids),
+                    targets=target_ids,
+                    valid_mask=binary_eval_mask.view_as(target_ids),
+                    token_losses=loss_per_token.view_as(target_ids),
+                )
+            return loss, accuracy, position_counts
         return loss, accuracy
 
     def compute_loss(
@@ -959,19 +1469,39 @@ class OnlineDFlashTrainer(Eagle3Trainer):
 
         data = self.prepare_data_for_draft_model(inputs)
 
-        loss, accuracy = self._compute_dflash_loss_and_accuracy(
+        loss, accuracy, position_counts = self._compute_dflash_loss_and_accuracy(
             model=model,
             input_ids=data["input_ids"],
             hidden_states=data["hidden_states"],
             loss_mask=data["loss_mask"],
+            return_position_metrics=True,
+            token_position_ids=data.get("token_position_ids"),
         )
 
-        self.log(
-            {
-                "train/loss": round(float(loss.item()), 4),
-                "train/accuracy": round(float(accuracy.item()), 4),
+        logged = {
+            "train/loss": round(float(loss.item()), 4),
+            "train/accuracy": round(float(accuracy.item()), 4),
+        }
+        logging_steps = max(int(getattr(self.args, "logging_steps", 10) or 10), 1)
+        step = int(getattr(getattr(self, "state", None), "global_step", 0))
+        if step % logging_steps == 0:
+            by_position = {
+                item["position"]: item
+                for item in finalize_dflash_position_metrics(position_counts)
             }
-        )
+            # Position 1 is the first drafted token. Position 15 is the K15
+            # proxy: prefix accuracy there means the whole block was correct.
+            for position in (1, 8, 15):
+                item = by_position.get(position)
+                if item is None:
+                    continue
+                top1 = item["independent_top1_accuracy"]
+                prefix = item["cumulative_prefix_accuracy"]
+                if top1 is not None:
+                    logged[f"train/pos{position}_top1"] = round(top1, 4)
+                if prefix is not None:
+                    logged[f"train/pos{position}_prefix"] = round(prefix, 4)
+        self.log(logged)
 
         return loss
 
@@ -986,18 +1516,30 @@ class OnlineDFlashTrainer(Eagle3Trainer):
         data = self.prepare_data_for_draft_model(inputs)
 
         with torch.no_grad():
-            loss, accuracy = self._compute_dflash_loss_and_accuracy(
+            loss, accuracy, position_counts = self._compute_dflash_loss_and_accuracy(
                 model=model,
                 input_ids=data["input_ids"],
                 hidden_states=data["hidden_states"],
                 loss_mask=data["loss_mask"],
+                return_position_metrics=True,
+                token_position_ids=data.get("token_position_ids"),
             )
 
-        self.log(
-            {
-                "eval/loss": round(float(loss.item()), 4),
-                "eval/accuracy": round(float(accuracy.item()), 4),
-            }
-        )
+        eval_metrics = {
+            "eval/loss": round(float(loss.item()), 4),
+            "eval/accuracy": round(float(accuracy.item()), 4),
+        }
+        for metrics in finalize_dflash_position_metrics(position_counts):
+            position = metrics["position"]
+            for name in (
+                "independent_top1_accuracy",
+                "cumulative_prefix_accuracy",
+                "conditional_prefix_accuracy",
+                "ce_loss",
+            ):
+                value = metrics[name]
+                if value is not None:
+                    eval_metrics[f"eval/position_{position}/{name}"] = round(value, 6)
+        self.log(eval_metrics)
 
         return loss, None, None

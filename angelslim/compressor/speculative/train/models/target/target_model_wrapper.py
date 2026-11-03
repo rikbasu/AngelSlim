@@ -23,6 +23,33 @@ from angelslim.utils import decide_device_for_distributed, print_with_rank
 
 from .cosyvoice3_llm import CosyVoice3LM
 
+_QWEN_VLM_TYPES = ("qwen3_vl", "qwen2_5_vl", "qwen3_5", "qwen3_5_moe")
+
+_torchvision_schema_library = None
+
+
+def _ensure_torchvision_image_only_import() -> None:
+    """Allow torchvision transforms when optional compiled detection ops are absent."""
+    global _torchvision_schema_library
+    if _torchvision_schema_library is not None:
+        return
+    try:
+        getattr(torch.ops.torchvision, "nms")
+        return
+    except AttributeError:
+        pass
+    library = torch.library.Library("torchvision", "FRAGMENT")
+    for schema in (
+        "nms(Tensor boxes, Tensor scores, float iou_threshold) -> Tensor",
+        "qnms(Tensor boxes, Tensor scores, float iou_threshold) -> Tensor",
+    ):
+        try:
+            library.define(schema)
+        except RuntimeError as exc:
+            if "already defined" not in str(exc):
+                raise
+    _torchvision_schema_library = library
+
 # ============================================================================
 # Picklable callable classes for vLLM apply_model (TP > 1 compatibility)
 #
@@ -575,6 +602,20 @@ class BaseBackend(ABC):
         """
         pass
 
+    def get_hidden_states_only(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Return auxiliary hidden states without requiring callers to use logits."""
+        hidden_states, _ = self.get_hidden_states_and_logits(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            **kwargs,
+        )
+        return hidden_states
+
     def _get_default_aux_layer_ids(self, total_layers: int) -> List[int]:
         """
         Calculate default auxiliary hidden state layer indices.
@@ -812,13 +853,22 @@ class Gemma4TransformersBackend(BaseBackend):
     """Transformers backend for the Gemma-4 conditional-generation model."""
 
     def load_model(self) -> None:
-        from transformers import AutoModelForImageTextToText, AutoProcessor
+        from transformers import (
+            AutoModelForImageTextToText,
+            AutoProcessor,
+            CompressedTensorsConfig,
+        )
 
         device = decide_device_for_distributed()
         model_kwargs = {
             "dtype": torch.bfloat16,
             "device_map": device,
             "trust_remote_code": True,
+            # Transformers' compressed-tensors linear wrapper is not runnable
+            # for this AWQ checkpoint (its onloaded Linear has no ``weight``).
+            # Dequantizing preserves the AWQ values while exposing ordinary
+            # BF16 linears for hidden-state teacher inference.
+            "quantization_config": CompressedTensorsConfig(run_compressed=False),
         }
         model_kwargs.update(self.kwargs)
         self.model = AutoModelForImageTextToText.from_pretrained(
@@ -864,6 +914,18 @@ class Gemma4TransformersBackend(BaseBackend):
         )
         return aux_hidden_states, outputs.logits.to(input_ids.device)
 
+    def get_hidden_states_only(self, input_ids, attention_mask=None, **kwargs):
+        with torch.no_grad():
+            outputs = self.model.model(
+                **self._build_model_inputs(input_ids, attention_mask, kwargs),
+                output_hidden_states=True,
+                use_cache=False,
+            )
+        return self._extract_auxiliary_hidden_states(
+            outputs.hidden_states,
+            kwargs.get("aux_hidden_states_layer_ids"),
+        )
+
     def get_aux_and_target_hiddens(self, input_ids, attention_mask=None, **kwargs):
         outputs = self._forward(input_ids, attention_mask, kwargs)
         aux_hidden_states = self._extract_auxiliary_hidden_states(
@@ -879,7 +941,7 @@ class Gemma4TransformersBackend(BaseBackend):
 class VLMTransformersBackend(BaseBackend):
     """VLM HuggingFace Transformers backend"""
 
-    SUPPORT_MODEL_TYPE = ["hunyuan_vl", "qwen3_vl", "qwen2_5_vl"]
+    SUPPORT_MODEL_TYPE = ["hunyuan_vl", "qwen3_vl", "qwen2_5_vl", "qwen3_5", "qwen3_5_moe", "gemma4"]
 
     def load_model(self):
         if self.target_model_type is None or self.target_model_type not in self.SUPPORT_MODEL_TYPE:
@@ -901,7 +963,7 @@ class VLMTransformersBackend(BaseBackend):
 
             # Load processor
             self.tokenizer = AutoProcessor.from_pretrained(self.model_path, trust_remote_code=True)
-        elif self.target_model_type in ("qwen3_vl", "qwen2_5_vl"):
+        elif self.target_model_type in _QWEN_VLM_TYPES:
             from transformers import AutoModelForImageTextToText, AutoProcessor
 
             device = decide_device_for_distributed()
@@ -925,6 +987,7 @@ class VLMTransformersBackend(BaseBackend):
                 trust_remote_code=True,
             )
         elif self.target_model_type == "gemma4":
+            _ensure_torchvision_image_only_import()
             from transformers import AutoModelForImageTextToText, AutoProcessor
 
             device = decide_device_for_distributed()
@@ -943,6 +1006,29 @@ class VLMTransformersBackend(BaseBackend):
             )
         else:
             raise ValueError(f"Unsupported target model type: {self.target_model_type}")
+
+    def _register_qwen35_prenorm_hook(self, captured: dict):
+        """Keep the last decoder output that vLLM's Eagle aux path serves.
+
+        Transformers ``capture_outputs(tie_last_hidden_states=True)`` replaces
+        ``hidden_states[-1]`` with the final RMSNorm. vLLM records the pre-norm
+        last decoder output at aux id ``num_layers``.
+        """
+
+        def last_layer_hook(module, args, output):
+            captured["value"] = output[0] if isinstance(output, tuple) else output
+            return output
+
+        return self.model.model.language_model.layers[-1].register_forward_hook(
+            last_layer_hook
+        )
+
+    @staticmethod
+    def _untie_qwen35_last_hidden(hidden_states, captured: dict):
+        last_layer = captured.get("value")
+        if last_layer is None or not hidden_states:
+            return hidden_states
+        return hidden_states[:-1] + (last_layer,)
 
     def _prepare_model_kwargs(self, device: str) -> dict:
         """
@@ -1018,10 +1104,14 @@ class VLMTransformersBackend(BaseBackend):
                 position_ids_list.append(kwargs["position_ids"].clone().detach())
             return args, kwargs
 
-        if self.target_model_type in ("qwen3_vl", "qwen2_5_vl"):
+        last_layer_hidden = {}
+        layer_handle = None
+        if self.target_model_type in _QWEN_VLM_TYPES:
             handle = self.model.model.language_model.register_forward_pre_hook(
                 hook, with_kwargs=True
             )
+            if self.target_model_type in ("qwen3_5", "qwen3_5_moe"):
+                layer_handle = self._register_qwen35_prenorm_hook(last_layer_hidden)
         elif self.target_model_type == "hunyuan_vl":
             handle = self.model.model.register_forward_pre_hook(hook, with_kwargs=True)
         else:
@@ -1031,6 +1121,7 @@ class VLMTransformersBackend(BaseBackend):
             pixel_values = pixel_values.squeeze(0)
         image_grid_thw = kwargs.get("image_grid_thw", None)
         input_position_ids = kwargs.get("input_position_ids", None)
+        mm_token_type_ids = kwargs.get("mm_token_type_ids", None)
         with torch.no_grad():
             outputs = self.model(
                 input_ids,
@@ -1038,11 +1129,14 @@ class VLMTransformersBackend(BaseBackend):
                 position_ids=input_position_ids,
                 pixel_values=pixel_values,
                 image_grid_thw=image_grid_thw,
+                mm_token_type_ids=mm_token_type_ids,
                 output_hidden_states=True,
                 output_logits=True,
             )
 
         handle.remove()
+        if layer_handle is not None:
+            layer_handle.remove()
         inputs_embeds = inputs_embeds_list[0].to(input_ids.device) if inputs_embeds_list else None
 
         if self.target_model_type == "hunyuan_vl":
@@ -1054,7 +1148,10 @@ class VLMTransformersBackend(BaseBackend):
 
         # Extract auxiliary hidden states
         aux_layer_ids = kwargs.get("aux_hidden_states_layer_ids", None)
-        hidden_states = self._extract_auxiliary_hidden_states(outputs.hidden_states, aux_layer_ids)
+        hidden_states = self._extract_auxiliary_hidden_states(
+            self._untie_qwen35_last_hidden(outputs.hidden_states, last_layer_hidden),
+            aux_layer_ids,
+        )
 
         # Return hidden states and logits on the same device as input
         return (
@@ -1063,6 +1160,19 @@ class VLMTransformersBackend(BaseBackend):
             inputs_embeds,
             position_ids,
         )
+
+    def get_hidden_states_only(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        result = self.get_hidden_states_and_logits(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            **kwargs,
+        )
+        return result[0]
 
     def get_aux_and_target_hiddens(
         self,
@@ -1090,7 +1200,7 @@ class VLMTransformersBackend(BaseBackend):
                 position_ids_list.append(kwargs["position_ids"].clone().detach())
             return args, kwargs
 
-        if self.target_model_type in ("qwen3_vl", "qwen2_5_vl"):
+        if self.target_model_type in _QWEN_VLM_TYPES:
             handle = self.model.model.language_model.register_forward_pre_hook(
                 hook, with_kwargs=True
             )
@@ -1104,12 +1214,14 @@ class VLMTransformersBackend(BaseBackend):
             pixel_values = pixel_values.squeeze(0)
         image_grid_thw = kwargs.get("image_grid_thw", None)
         input_position_ids = kwargs.get("input_position_ids", None)
+        mm_token_type_ids = kwargs.get("mm_token_type_ids", None)
         with torch.no_grad():
             outputs = self.model(
                 input_ids,
                 pixel_values=pixel_values,
                 position_ids=input_position_ids,
                 image_grid_thw=image_grid_thw,
+                mm_token_type_ids=mm_token_type_ids,
                 attention_mask=attention_mask,
                 output_hidden_states=True,
                 output_logits=True,
@@ -1156,7 +1268,7 @@ class VLMVLLMBackend(BaseBackend):
         - hunyuan_vl: HunYuan-VL series vision-language models
     """
 
-    SUPPORT_MODEL_TYPE = ["qwen3_vl", "qwen2_5_vl", "hunyuan_vl"]
+    SUPPORT_MODEL_TYPE = ["qwen3_vl", "qwen2_5_vl", "qwen3_5", "qwen3_5_moe", "hunyuan_vl", "gemma4"]
 
     def load_model(self) -> None:
         """Load VLM model using vLLM.
@@ -1249,7 +1361,7 @@ class VLMVLLMBackend(BaseBackend):
 
     def _get_language_model_module_name(self) -> str:
         """Return the language model sub-module name based on model type."""
-        if self.target_model_type in ("qwen3_vl", "qwen2_5_vl"):
+        if self.target_model_type in _QWEN_VLM_TYPES or self.target_model_type == "gemma4":
             return "language_model"
         elif self.target_model_type == "hunyuan_vl":
             return "model"
@@ -1340,11 +1452,17 @@ class VLMVLLMBackend(BaseBackend):
             raw_videos is not None and any(vids for vids in raw_videos)
         )
         if has_multimodal and self.tokenizer is not None:
-            # Qwen VL models: image_token attribute or fall back to tokenizer vocab
-            _image_token = getattr(self.tokenizer, "image_token", "<|image_pad|>")
-            _tok = getattr(self.tokenizer, "tokenizer", self.tokenizer)
-            _vocab = _tok.get_vocab() if hasattr(_tok, "get_vocab") else {}
-            image_pad_token_id = _vocab.get(_image_token)
+            image_pad_token_id = getattr(
+                self.tokenizer, "image_token_id", None
+            )
+            if image_pad_token_id is None:
+                # Qwen VL models expose an image token string rather than its id.
+                _image_token = getattr(
+                    self.tokenizer, "image_token", "<|image_pad|>"
+                )
+                _tok = getattr(self.tokenizer, "tokenizer", self.tokenizer)
+                _vocab = _tok.get_vocab() if hasattr(_tok, "get_vocab") else {}
+                image_pad_token_id = _vocab.get(_image_token)
 
         prompts = []
         for i in range(batch_size):
@@ -1405,6 +1523,18 @@ class VLMVLLMBackend(BaseBackend):
             "Please use get_aux_and_target_hiddens instead."
         )
 
+    def get_hidden_states_only(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        return self.get_aux_and_target_hiddens(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            **kwargs,
+        )["hidden_states"]
+
     def get_aux_and_target_hiddens(
         self,
         input_ids: torch.Tensor,
@@ -1449,6 +1579,7 @@ class VLMVLLMBackend(BaseBackend):
         # vLLM's multiproc_executor can serialize them via pickle when TP > 1.
         setup_hooks_fn = _VLMSetupHooksFn(_CACHE_ATTR, _tp_size, lm_module_name)
         collect_and_cleanup_fn = _VLMCollectAndCleanupFn(_CACHE_ATTR)
+        generation_outputs = None
 
         # Register hooks inside the worker; include in try-finally so that
         # partially-registered hooks are always cleaned up on failure.
@@ -1466,7 +1597,10 @@ class VLMVLLMBackend(BaseBackend):
                 max_tokens=1,
                 logprobs=0,
             )
-            _ = self.model.generate(prompts, sampling_params=sampling_params)
+            generation_outputs = self.model.generate(
+                prompts,
+                sampling_params=sampling_params,
+            )
 
         finally:
             # Read data from the worker and clean up hooks
@@ -1532,6 +1666,121 @@ class VLMVLLMBackend(BaseBackend):
             )
             target_hidden_states = all_hs[-1]
 
+        # vLLM packs a multi-request prefill into one (sum(sequence_lengths), D)
+        # tensor. Reconstruct the padded trainer batch before returning it;
+        # treating the packed dimension as one sequence only works for batch=1.
+        unpacked_vllm_batch = False
+        if (
+            aux_hidden_states.dim() == 2
+            and input_ids.dim() == 2
+            and generation_outputs
+        ):
+            prompt_lengths = [
+                len(output.prompt_token_ids) for output in generation_outputs
+            ]
+            packed_prompt_length = sum(prompt_lengths)
+            batch_size, padded_length = input_ids.shape
+            sample_offsets = []
+            running_offset = 0
+            for prompt_length in prompt_lengths:
+                sample_offsets.append(running_offset)
+                running_offset += prompt_length
+
+            # vLLM may schedule packed requests by length instead of input
+            # order. Recover the execution segments from resetting position
+            # IDs, then map each segment back to generation_outputs.
+            if position_ids is not None:
+                flat_positions = position_ids
+                while flat_positions.dim() > 1:
+                    flat_positions = flat_positions[0]
+                flat_positions = flat_positions[:packed_prompt_length]
+                reset_points = (
+                    (flat_positions[1:] <= flat_positions[:-1])
+                    .nonzero(as_tuple=False)
+                    .flatten()
+                    .add(1)
+                    .tolist()
+                )
+                boundaries = [0, *reset_points, packed_prompt_length]
+                execution_lengths = [
+                    boundaries[index + 1] - boundaries[index]
+                    for index in range(len(boundaries) - 1)
+                ]
+                if sorted(execution_lengths) == sorted(prompt_lengths):
+                    by_length: dict[int, list[int]] = {}
+                    for sample_index, prompt_length in enumerate(prompt_lengths):
+                        by_length.setdefault(prompt_length, []).append(sample_index)
+                    remapped_offsets = [0] * batch_size
+                    for execution_index, prompt_length in enumerate(
+                        execution_lengths
+                    ):
+                        sample_index = by_length[prompt_length].pop(0)
+                        remapped_offsets[sample_index] = boundaries[execution_index]
+                    sample_offsets = remapped_offsets
+                    if sample_offsets != sorted(sample_offsets):
+                        print_with_rank(
+                            "[VLM] Restored packed scheduler order with offsets "
+                            f"{sample_offsets}"
+                        )
+
+            def _unpack_padded(hidden: Optional[torch.Tensor]):
+                if hidden is None or hidden.dim() != 2:
+                    return hidden
+                if hidden.shape[0] < packed_prompt_length:
+                    raise RuntimeError(
+                        "Captured fewer packed hidden-state rows than expected: "
+                        f"{hidden.shape[0]} < {packed_prompt_length}"
+                    )
+                padded = hidden.new_zeros(
+                    (batch_size, padded_length, hidden.shape[-1])
+                )
+                for batch_idx, prompt_length in enumerate(prompt_lengths):
+                    positions = torch.nonzero(
+                        attention_mask[batch_idx], as_tuple=False
+                    ).flatten()
+                    source_ids = input_ids[batch_idx, positions].tolist()
+                    prompt_ids = generation_outputs[
+                        batch_idx
+                    ].prompt_token_ids
+                    if source_ids == prompt_ids:
+                        prompt_indices = list(range(prompt_length))
+                    else:
+                        # Multimodal expansion may insert image boundary tokens
+                        # that are absent from the HF collator's sequence.
+                        # Preserve all original token positions by matching the
+                        # source IDs as an ordered subsequence of vLLM's prompt.
+                        prompt_indices = []
+                        prompt_index = 0
+                        for token_id in source_ids:
+                            while (
+                                prompt_index < prompt_length
+                                and prompt_ids[prompt_index] != token_id
+                            ):
+                                prompt_index += 1
+                            if prompt_index == prompt_length:
+                                raise RuntimeError(
+                                    "Could not align trainer input IDs with "
+                                    f"vLLM prompt for sample {batch_idx}"
+                                )
+                            prompt_indices.append(prompt_index)
+                            prompt_index += 1
+                    positions = positions.to(padded.device)
+                    selected = hidden[
+                        sample_offsets[batch_idx]
+                        + torch.tensor(
+                            prompt_indices,
+                            dtype=torch.long,
+                            device=hidden.device,
+                        )
+                    ]
+                    padded[batch_idx, positions] = selected.to(padded.device)
+                return padded
+
+            aux_hidden_states = _unpack_padded(aux_hidden_states)
+            target_hidden_states = _unpack_padded(target_hidden_states)
+            inputs_embeds = _unpack_padded(inputs_embeds)
+            unpacked_vllm_batch = True
+
         # vLLM internally uses packed/flattened format, so hook-captured hidden
         # states are 2D (seq_len, hidden_size) without a batch dimension.
         # Add batch dimension to match the expected (B, N, D) format used by
@@ -1558,15 +1807,30 @@ class VLMVLLMBackend(BaseBackend):
                 position_ids = position_ids.unsqueeze(1)
             # else: regular 2D (B, N), keep as-is
 
-        # Truncate to input_ids length to exclude decode-step hidden states.
+        # Truncate to the expanded vLLM prompt length to exclude decode-step
+        # hidden states. Multimodal processing replaces one image placeholder
+        # with many image tokens, so the source attention-mask length is not
+        # the model's actual prefill length.
         # vLLM's generate() runs prefill (all input tokens) then decode
         # (max_tokens=1 new token). Our hooks capture both stages, so the
         # concatenated hidden states may be longer than the input sequence.
-        # We only need the prefill hidden states (matching input_ids length).
-        if attention_mask is not None:
-            expected_len = int(attention_mask.sum(dim=-1).max().item())
+        # We only need the prefill hidden states.
+        if unpacked_vllm_batch:
+            expected_len = input_ids.shape[1]
+        elif generation_outputs:
+            expected_len = sum(
+                len(output.prompt_token_ids)
+                for output in generation_outputs
+            )
+        elif attention_mask is not None:
+            expected_len = int(attention_mask.sum().item())
         else:
-            expected_len = input_ids.shape[-1]
+            expected_len = input_ids.numel()
+        if aux_hidden_states.shape[1] < expected_len:
+            raise RuntimeError(
+                "Captured fewer VLM hidden-state rows than the expanded prompt: "
+                f"{aux_hidden_states.shape[1]} < {expected_len}"
+            )
 
         if aux_hidden_states.shape[1] > expected_len:
             aux_hidden_states = aux_hidden_states[:, :expected_len, :]
@@ -2250,6 +2514,19 @@ class TargetModelWrapper:
             Tuple of (aux_hidden_states, target_hidden_states)
         """
         return self.backend.get_aux_and_target_hiddens(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            **kwargs,
+        )
+
+    def get_hidden_states_only(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Get selected target hidden states without materializing vocabulary logits."""
+        return self.backend.get_hidden_states_only(
             input_ids=input_ids,
             attention_mask=attention_mask,
             **kwargs,

@@ -48,9 +48,11 @@ def parse_args():
         "--target_backend",
         type=str,
         default="hf",
-        choices=["hf"],
+        choices=["hf", "vllm"],
         help="Target model backend",
     )
+    parser.add_argument("--gpu_memory_utilization", type=float, default=0.8)
+    parser.add_argument("--max_num_seqs", type=int, default=1)
     parser.add_argument(
         "--torch_dtype",
         type=str,
@@ -90,10 +92,27 @@ def parse_args():
         "--sample_num", type=int, default=None, help="Limit number of samples (for debugging)"
     )
     parser.add_argument(
+        "--min_loss_tokens",
+        type=int,
+        default=None,
+        help="Minimum assistant-label tokens per cached example.",
+    )
+    parser.add_argument(
         "--shard_size",
         type=int,
         default=0,
         help="Save a new sub-directory every N files (0 = no sharding)",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Skip sample indices whose cache files already exist.",
+    )
+    parser.add_argument(
+        "--max_cache_tokens",
+        type=int,
+        default=None,
+        help="Skip cache generation for sequences longer than this many tokens.",
     )
 
     return parser.parse_args()
@@ -131,7 +150,12 @@ def main():
     # --------------------------------------------------------------------------
     rank0_print("Loading draft model config...")
     draft_model_config = DraftModelConfig.from_file(args.draft_model_config_path)
-    dflash_config = getattr(draft_model_config, "dflash_config", {}) or {}
+    target_model_type = getattr(draft_model_config, "target_model_type", None)
+    dflash_config = (
+        getattr(draft_model_config, "dflash_config", None)
+        or getattr(draft_model_config, "dflare_config", None)
+        or {}
+    )
     target_layer_ids = dflash_config.get("target_layer_ids", None)
     if target_layer_ids is None:
         raise ValueError(
@@ -147,12 +171,33 @@ def main():
     torch_dtype = dtype_map.get(args.torch_dtype, torch.bfloat16)
 
     rank0_print("Loading target model...")
+    target_extra_kwargs = {}
+    if args.target_backend == "vllm":
+        target_extra_kwargs = {
+            # Hook-based extraction generates one token after prefill, so the
+            # engine needs one slot beyond the dataset truncation length.
+            "max_model_len": args.model_max_length + 1,
+            "gpu_memory_utilization": args.gpu_memory_utilization,
+            "enforce_eager": True,
+            "max_num_seqs": args.max_num_seqs,
+            "limit_mm_per_prompt": (
+                {"image": 1, "video": 0}
+                if target_model_type == "gemma4"
+                else {"image": 0, "video": 0}
+            ),
+        }
     target_model = create_target_model(
         backend=args.target_backend,
         model_path=args.target_model_name_or_path,
-        modal_type="LLM",
+        modal_type=(
+            "VLM"
+            if args.target_backend == "vllm" and target_model_type == "gemma4"
+            else ("Gemma4" if target_model_type == "gemma4" else "LLM")
+        ),
         torch_dtype=torch_dtype,
         trust_remote_code=args.trust_remote_code,
+        target_model_type=target_model_type,
+        **target_extra_kwargs,
     )
     rank0_print("Target model loaded successfully")
 
@@ -164,17 +209,12 @@ def main():
     args.modal_type = "LLM"  # DFlash uses the LLM tokenisation path
     args.training_mode = "online"  # We want the text→token builder, not offline .ckpt loader
 
-    from transformers import AutoTokenizer
-
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.target_model_name_or_path, trust_remote_code=True
-    )
-
     dataset_manager = DatasetManager(
         data_args=args,
-        tokenizer=tokenizer,
+        tokenizer=target_model.tokenizer,
         model_max_length=args.model_max_length,
         chat_template_type=args.chat_template_type,
+        target_model_type=target_model_type,
     )
 
     # Restore modal_type to DFlash so DFlash-specific filtering (min_loss_tokens) applies
@@ -238,6 +278,8 @@ def main():
     # 6. Main loop: forward target model, save hidden states
     # --------------------------------------------------------------------------
     global_idx = 0  # index within this rank's portion
+    skipped_nonfinite = 0
+    skipped_too_long = 0
     total = len(dataloader)
     t0 = time.time()
 
@@ -255,11 +297,32 @@ def main():
         if loss_mask.dim() == 3:
             loss_mask = loss_mask.squeeze(1)
 
+        batch_sample_indices = [
+            rank * len(dataloader) + global_idx + i
+            for i in range(input_ids.size(0))
+        ]
+
+        def cache_path(sample_idx):
+            save_dir = (
+                output_dir / f"shard_{sample_idx // args.shard_size:05d}"
+                if args.shard_size > 0
+                else output_dir
+            )
+            return save_dir / f"sample_{sample_idx:08d}_rank{rank}.ckpt"
+
+        if args.resume and all(cache_path(idx).exists() for idx in batch_sample_indices):
+            global_idx += input_ids.size(0)
+            continue
+        if args.max_cache_tokens is not None and input_ids.shape[-1] > args.max_cache_tokens:
+            skipped_too_long += input_ids.size(0)
+            global_idx += input_ids.size(0)
+            continue
+
         input_ids = input_ids.to(f"cuda:{local_rank}")
         attention_mask = attention_mask.to(f"cuda:{local_rank}")
 
         # Run target model
-        hidden_states, _ = target_model.get_hidden_states_and_logits(
+        hidden_states = target_model.get_hidden_states_only(
             input_ids=input_ids,
             attention_mask=attention_mask,
             aux_hidden_states_layer_ids=target_layer_ids,
@@ -272,18 +335,20 @@ def main():
             sample_idx = rank * len(dataloader) + global_idx
             global_idx += 1
 
-            if args.shard_size > 0:
-                shard_id = sample_idx // args.shard_size
-                save_dir = output_dir / f"shard_{shard_id:05d}"
-                save_dir.mkdir(parents=True, exist_ok=True)
-            else:
-                save_dir = output_dir
-
-            ckpt_path = save_dir / f"sample_{sample_idx:08d}_rank{rank}.ckpt"
+            ckpt_path = cache_path(sample_idx)
+            ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+            sample_hidden_states = hidden_states[i : i + 1]
+            if not torch.isfinite(sample_hidden_states).all():
+                skipped_nonfinite += 1
+                rank0_print(
+                    f"[rank {rank}] Skipping sample {sample_idx}: "
+                    "target hidden states contain NaN or Inf"
+                )
+                continue
 
             ckpt = {
                 "input_ids": input_ids[i : i + 1].cpu(),  # [1, S]
-                "hidden_states": hidden_states[i : i + 1].cpu().to(torch.bfloat16),  # [1, S, D*L]
+                "hidden_states": sample_hidden_states.cpu().to(torch.bfloat16),  # [1, S, D*L]
                 "loss_mask": loss_mask[i : i + 1].cpu(),  # [1, S]
                 "attention_mask": attention_mask[i : i + 1].cpu(),  # [1, S]
             }
@@ -302,7 +367,11 @@ def main():
     if world_size > 1:
         dist.barrier()
 
-    rank0_print(f"Data generation complete. " f"Saved files to {output_dir}")
+    rank0_print(
+        f"Data generation complete. Saved files to {output_dir}. "
+        f"Skipped non-finite samples: {skipped_nonfinite}. "
+        f"Skipped overlength samples: {skipped_too_long}"
+    )
 
 
 if __name__ == "__main__":

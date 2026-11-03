@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import re
 from abc import ABCMeta, abstractmethod
 from typing import Any, Dict, List, Optional
@@ -344,8 +345,13 @@ class OnlineDatasetBuilder(DatasetBuilder):
         return content
 
     def _build_messages(self, source: List[Dict]) -> List[Dict]:
-        # System message
-        if source[0]["role"] != "system":
+        # System message. A draft must see the same prompt the target is served
+        # with; ANGELSLIM_NO_DEFAULT_SYSTEM_PROMPT=1 skips the template default
+        # when rows (and serving) carry no system turn.
+        skip_default = os.environ.get("ANGELSLIM_NO_DEFAULT_SYSTEM_PROMPT") == "1"
+        if source[0]["role"] != "system" and (skip_default or not self.system_prompt):
+            messages = []
+        elif source[0]["role"] != "system":
             messages = [{"role": "system", "content": self.system_prompt}]
         else:
             messages = [{"role": "system", "content": source[0]["content"]}]

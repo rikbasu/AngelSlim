@@ -82,6 +82,7 @@ class HiddenStateGenerator:
         rank: int = 0,
         draft_vocab_size: int = None,
         target_vocab_size: int = None,
+        aux_hidden_states_layer_ids: list[int] | None = None,
     ):
         """
         Initialize the hidden state generator.
@@ -93,6 +94,7 @@ class HiddenStateGenerator:
             rank: Process rank for distributed training
             draft_vocab_size: Size of draft model vocabulary (required for vocab mapping)
             target_vocab_size: Size of target model vocabulary (required for vocab mapping)
+            aux_hidden_states_layer_ids: Exact target layers required by the draft
         """
         self.target_model = target_model
         self.output_dir = Path(output_dir)
@@ -100,6 +102,7 @@ class HiddenStateGenerator:
         self.rank = rank
         self.draft_vocab_size = draft_vocab_size
         self.target_vocab_size = target_vocab_size
+        self.aux_hidden_states_layer_ids = aux_hidden_states_layer_ids
         _max_pixels = os.environ.get("MAX_PIXELS")
         _min_pixels = os.environ.get("MIN_PIXELS", "1024")
         self.max_pixels = int(_max_pixels) if _max_pixels is not None else None
@@ -343,7 +346,10 @@ class HiddenStateGenerator:
             for k, v in row.items():
                 if isinstance(v, torch.Tensor) and v is not None:
                     row[k] = v.to(device)
-            results = self.target_model.get_aux_and_target_hiddens(**row)
+            results = self.target_model.get_aux_and_target_hiddens(
+                **row,
+                aux_hidden_states_layer_ids=self.aux_hidden_states_layer_ids,
+            )
             # hidden_states: B, N_vllm, 3*D
             # target_hiddens: B, N_vllm, D
             for k, v in results.items():
@@ -522,6 +528,8 @@ def parse_arguments() -> argparse.Namespace:
         choices=["hf", "vllm"],
         help="Backend for target model",
     )
+    parser.add_argument("--gpu_memory_utilization", type=float, default=0.5)
+    parser.add_argument("--max_num_seqs", type=int, default=1)
     parser.add_argument(
         "--modal_type",
         type=str,
@@ -576,6 +584,12 @@ def parse_arguments() -> argparse.Namespace:
         type=int,
         default=None,
         help="Number of max samples for data preprocessing",
+    )
+    parser.add_argument(
+        "--min_loss_tokens",
+        type=int,
+        default=None,
+        help="Minimum assistant-label tokens retained for DFlare training.",
     )
     parser.add_argument(
         "--shuffle_seed", type=int, default=42, help="Random seed for shuffling dataset"
@@ -717,11 +731,20 @@ def main():
 
         draft_vocab_size = None
         target_vocab_size = None
+        aux_hidden_states_layer_ids = None
         if args.draft_model_config_path is not None:
             draft_config = DraftModelConfig.from_file(args.draft_model_config_path)
             draft_vocab_size = getattr(draft_config, "draft_vocab_size", None)
             target_vocab_size = getattr(draft_config, "vocab_size", None)
             args.target_model_type = getattr(draft_config, "target_model_type", None)
+            draft_method_config = (
+                getattr(draft_config, "dflash_config", None)
+                or getattr(draft_config, "dflare_config", None)
+                or {}
+            )
+            aux_hidden_states_layer_ids = draft_method_config.get(
+                "target_layer_ids"
+            )
             logger.info(
                 f"Loaded from draft model config: draft_vocab_size={draft_vocab_size}, "
                 f"target_vocab_size={target_vocab_size}, "
@@ -753,6 +776,15 @@ def main():
 
         # Load target model
         torch_dtype = get_torch_dtype(args.torch_dtype)
+        target_extra_kwargs = {}
+        if args.target_backend == "vllm":
+            target_extra_kwargs = {
+                "max_model_len": args.model_max_length + 1,
+                "gpu_memory_utilization": args.gpu_memory_utilization,
+                "enforce_eager": True,
+                "max_num_seqs": args.max_num_seqs,
+                "limit_mm_per_prompt": {"image": 1, "video": 0},
+            }
         target_model = create_target_model(
             backend=args.target_backend,
             modal_type=args.modal_type,
@@ -760,6 +792,7 @@ def main():
             torch_dtype=torch_dtype,
             trust_remote_code=args.trust_remote_code,
             target_model_type=args.target_model_type,
+            **target_extra_kwargs,
         )
         logger.info(
             f"Target model loaded: {args.target_model_name_or_path}",
@@ -787,6 +820,7 @@ def main():
             rank=rank,
             draft_vocab_size=draft_vocab_size,
             target_vocab_size=target_vocab_size,
+            aux_hidden_states_layer_ids=aux_hidden_states_layer_ids,
         )
         successful, failed = generator.generate(dataset_slice)
 

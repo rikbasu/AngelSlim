@@ -101,6 +101,21 @@ def _dist_gather(obj: Any, dst: int = 0) -> Optional[List[Any]]:
 # mt-bench).
 # ---------------------------------------------------------------------------
 def load_and_process_dataset(data_name: str):
+    if os.path.isfile(data_name):
+        ds = load_dataset("json", data_files=data_name, split="train")
+
+        def extract_turns(row):
+            messages = row.get("conversations") or row.get("messages") or []
+            turns = [
+                message["content"]
+                for message in messages
+                if message.get("role") == "user"
+                and isinstance(message.get("content"), str)
+            ]
+            return {"turns": turns}
+
+        return ds.map(extract_turns)
+
     if data_name == "gsm8k":
         ds = load_dataset("openai/gsm8k", "main", split="test")
         fmt = (

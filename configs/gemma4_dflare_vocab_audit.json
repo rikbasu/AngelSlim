@@ -1,0 +1,23 @@
+{
+  "target": {
+    "vocab_size": 262144,
+    "hidden_size": 2560,
+    "tie_word_embeddings": true,
+    "bos_token_id": 2,
+    "eos_token_id": 1,
+    "pad_token_id": 0
+  },
+  "draft": {
+    "config": "gemma4_dflare.json",
+    "draft_vocab_size": 16384
+  },
+  "mapping": null,
+  "candidate_vocab_sizes": [
+    4096,
+    8192,
+    16384
+  ],
+  "dtype_bytes": 2,
+  "draft_quantization": "fp8",
+  "vllm_source": "../../vllm-nightly-dflare"
+}

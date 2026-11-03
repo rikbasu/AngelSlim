@@ -10,4 +10,5 @@ eagle/index
 spec_exit
 dcut
 dflare
+dflare_reduced_vocab
 :::

@@ -25,6 +25,17 @@ except ImportError:  # pragma: no cover - depends on the installed torch build.
     create_block_mask = None
     flex_attention = None
 
+_compiled_flex_attention = None
+
+
+def _get_compiled_flex_attention():
+    global _compiled_flex_attention
+    if flex_attention is None:
+        return None
+    if _compiled_flex_attention is None:
+        _compiled_flex_attention = torch.compile(flex_attention, dynamic=True)
+    return _compiled_flex_attention
+
 
 class Gemma4DFlareConfig(PretrainedConfig):
     """Configuration for a Gemma-4-conditioned DFlare draft network."""
@@ -39,6 +50,8 @@ class Gemma4DFlareConfig(PretrainedConfig):
         num_hidden_layers: int = 7,
         num_target_layers: int = 9,
         target_hidden_size: int = 2560,
+        target_embedding_size: int | None = None,
+        target_head_hidden_size: int | None = None,
         num_attention_heads: int = 8,
         num_key_value_heads: int = 2,
         head_dim: int = 256,
@@ -49,6 +62,9 @@ class Gemma4DFlareConfig(PretrainedConfig):
         mask_token_id: int = 4,
         target_layer_ids: Optional[List[int]] = None,
         attention_backend: str = "eager",
+        tail_adapter_rank: int = 0,
+        tail_adapter_start: int = 16,
+        tail_adapter_scale: float = 1.0,
         dflare_config: Optional[dict] = None,
         dflash_config: Optional[dict] = None,
         **kwargs,
@@ -60,6 +76,12 @@ class Gemma4DFlareConfig(PretrainedConfig):
         self.num_hidden_layers = num_hidden_layers
         self.num_target_layers = num_target_layers
         self.target_hidden_size = target_hidden_size
+        self.target_embedding_size = int(
+            target_embedding_size or target_hidden_size
+        )
+        self.target_head_hidden_size = int(
+            target_head_hidden_size or self.target_embedding_size
+        )
         self.num_attention_heads = num_attention_heads
         self.num_key_value_heads = num_key_value_heads
         self.head_dim = head_dim
@@ -69,6 +91,9 @@ class Gemma4DFlareConfig(PretrainedConfig):
         self.num_anchors = num_anchors
         self.mask_token_id = mask_token_id
         self.attention_backend = attention_backend
+        self.tail_adapter_rank = int(tail_adapter_rank)
+        self.tail_adapter_start = int(tail_adapter_start)
+        self.tail_adapter_scale = float(tail_adapter_scale)
         self.dflare_config = dict(dflare_config or dflash_config or {})
         # Keep the legacy key populated because the shared AngelSlim DFlash
         # trainer reads it for target-layer capture and mask-token settings.
@@ -106,6 +131,7 @@ def _apply_rope(
     hidden_states: torch.Tensor,
     position_ids: torch.Tensor,
     theta: float,
+    layout: str = "legacy",
 ) -> torch.Tensor:
     """Apply standard rotary embeddings to [B, H, S, D] states."""
     head_dim = hidden_states.shape[-1]
@@ -121,8 +147,17 @@ def _apply_rope(
         position_ids.float(),
         inv_freq,
     )
-    cos = frequencies.cos().repeat_interleave(2, dim=-1).unsqueeze(1)
-    sin = frequencies.sin().repeat_interleave(2, dim=-1).unsqueeze(1)
+    if layout == "neox":
+        # _rotate_half pairs the first and second halves, so both halves use
+        # the same frequencies.
+        cos = torch.cat((frequencies.cos(), frequencies.cos()), dim=-1).unsqueeze(1)
+        sin = torch.cat((frequencies.sin(), frequencies.sin()), dim=-1).unsqueeze(1)
+    elif layout == "legacy":
+        # Compatibility for checkpoints trained before the NeoX pairing fix.
+        cos = frequencies.cos().repeat_interleave(2, dim=-1).unsqueeze(1)
+        sin = frequencies.sin().repeat_interleave(2, dim=-1).unsqueeze(1)
+    else:
+        raise ValueError(f"Unsupported DFlare RoPE layout: {layout}")
     return hidden_states * cos.to(hidden_states.dtype) + _rotate_half(
         hidden_states
     ) * sin.to(hidden_states.dtype)
@@ -136,6 +171,7 @@ class _Gemma4DFlareAttention(nn.Module):
         self.num_kv_groups = self.num_heads // self.num_kv_heads
         self.head_dim = config.head_dim
         self.rope_theta = config.rope_theta
+        self.rope_layout = config.dflare_config.get("rope_layout", "legacy")
         self.q_proj = nn.Linear(
             config.hidden_size,
             self.num_heads * self.head_dim,
@@ -152,12 +188,12 @@ class _Gemma4DFlareAttention(nn.Module):
             bias=False,
         )
         self.k_proj_target = nn.Linear(
-            config.hidden_size,
+            config.target_hidden_size,
             self.num_kv_heads * self.head_dim,
             bias=False,
         )
         self.v_proj_target = nn.Linear(
-            config.hidden_size,
+            config.target_hidden_size,
             self.num_kv_heads * self.head_dim,
             bias=False,
         )
@@ -199,13 +235,21 @@ class _Gemma4DFlareAttention(nn.Module):
         query = self.q_norm(query)
         context_key = self.k_norm(context_key)
         draft_key = self.k_norm(draft_key)
-        query = _apply_rope(query, draft_position_ids, self.rope_theta)
+        query = _apply_rope(
+            query, draft_position_ids, self.rope_theta, self.rope_layout
+        )
         context_key = _apply_rope(
             context_key,
             context_position_ids,
             self.rope_theta,
+            self.rope_layout,
         )
-        draft_key = _apply_rope(draft_key, draft_position_ids, self.rope_theta)
+        draft_key = _apply_rope(
+            draft_key,
+            draft_position_ids,
+            self.rope_theta,
+            self.rope_layout,
+        )
 
         key = torch.cat((context_key, draft_key), dim=2)
         value = torch.cat((context_value, draft_value), dim=2)
@@ -217,7 +261,9 @@ class _Gemma4DFlareAttention(nn.Module):
             and create_block_mask is not None
             and flex_attention is not None
         ):
-            attended = flex_attention(
+            compiled_flex_attention = _get_compiled_flex_attention()
+            assert compiled_flex_attention is not None
+            attended = compiled_flex_attention(
                 query,
                 key,
                 value,
@@ -302,6 +348,7 @@ class Gemma4DFlareDraftModel(PreTrainedModel):
 
     def __init__(self, config: Gemma4DFlareConfig):
         super().__init__(config)
+        self.all_tied_weights_keys = {}
         self.layers = nn.ModuleList(
             [_Gemma4DFlareLayer(config) for _ in range(config.num_hidden_layers)]
         )
@@ -309,6 +356,24 @@ class Gemma4DFlareDraftModel(PreTrainedModel):
         self.hidden_norm = _RMSNorm(
             config.target_hidden_size,
             config.rms_norm_eps,
+        )
+        self.input_projection = (
+            nn.Linear(
+                config.target_embedding_size,
+                config.hidden_size,
+                bias=False,
+            )
+            if config.target_embedding_size != config.hidden_size
+            else None
+        )
+        self.output_projection = (
+            nn.Linear(
+                config.hidden_size,
+                config.target_head_hidden_size,
+                bias=False,
+            )
+            if config.target_head_hidden_size != config.hidden_size
+            else None
         )
         self.layer_fusion_weights = nn.Parameter(
             torch.zeros(config.num_hidden_layers, config.num_target_layers)
@@ -325,7 +390,29 @@ class Gemma4DFlareDraftModel(PreTrainedModel):
             self.layer_fusion_weights.data[draft_layer, target_layer] = 2.0
         self.block_size = config.block_size
         self.mask_token_id = config.dflare_config["mask_token_id"]
+        if config.tail_adapter_rank > 0:
+            self.tail_adapter_down = nn.Linear(
+                config.hidden_size,
+                config.tail_adapter_rank,
+                bias=False,
+            )
+            self.tail_adapter_up = nn.Linear(
+                config.tail_adapter_rank,
+                config.hidden_size,
+                bias=False,
+            )
+            nn.init.normal_(self.tail_adapter_down.weight, std=0.02)
+            nn.init.zeros_(self.tail_adapter_up.weight)
+        else:
+            self.tail_adapter_down = None
+            self.tail_adapter_up = None
         self.post_init()
+        if self.tail_adapter_up is not None:
+            nn.init.zeros_(self.tail_adapter_up.weight)
+
+    def get_input_embeddings(self):
+        """DFlare receives target/noise embeddings from the trainer."""
+        return None
 
     def _make_flex_block_mask(
         self,
@@ -431,7 +518,11 @@ class Gemma4DFlareDraftModel(PreTrainedModel):
             else:
                 effective_mask = None
 
-        hidden_states = noise_embedding
+        hidden_states = (
+            self.input_projection(noise_embedding)
+            if self.input_projection is not None
+            else noise_embedding
+        )
         for layer_index, layer in enumerate(self.layers):
             hidden_states = layer(
                 hidden_states,
@@ -440,7 +531,25 @@ class Gemma4DFlareDraftModel(PreTrainedModel):
                 draft_position_ids,
                 effective_mask,
             )
-        return self.norm(hidden_states)
+        hidden_states = self.norm(hidden_states)
+        if self.tail_adapter_down is not None and self.tail_adapter_up is not None:
+            local_offsets = torch.arange(
+                draft_length,
+                device=hidden_states.device,
+            ) % self.block_size
+            tail_mask = (
+                local_offsets >= self.config.tail_adapter_start
+            ).to(hidden_states.dtype).view(1, -1, 1)
+            tail_residual = self.tail_adapter_up(
+                F.silu(self.tail_adapter_down(hidden_states))
+            )
+            hidden_states = (
+                hidden_states
+                + self.config.tail_adapter_scale * tail_mask * tail_residual
+            )
+        if self.output_projection is not None:
+            hidden_states = self.output_projection(hidden_states)
+        return hidden_states
 
     @staticmethod
     def _is_block_mask(mask: Optional[torch.Tensor]) -> bool:

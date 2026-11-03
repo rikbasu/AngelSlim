@@ -48,6 +48,86 @@ from .base_dataset_builder import OnlineDatasetBuilder
 from .dataset_builder_factory import DatasetBuilderFactory
 
 
+def _first_jsonl_record(datapath: Union[str, List[str], None]) -> Optional[Dict[str, Any]]:
+    if not datapath:
+        return None
+    first_path = datapath[0] if isinstance(datapath, (list, tuple)) else datapath
+    try:
+        with open(first_path, "r", encoding="utf-8") as handle:
+            first_line = handle.readline()
+        if not first_line:
+            return None
+        record = json.loads(first_line)
+        return record if isinstance(record, dict) else None
+    except Exception:
+        return None
+
+
+def _jsonl_has_hard_tail_field(datapath: Union[str, List[str], None]) -> bool:
+    """Return True when the first JSONL record is a hard-tail training row."""
+    record = _first_jsonl_record(datapath)
+    return bool(record) and "hard_tail_assistant_token_index" in record
+
+
+def _hard_tail_feature_fields(datapath: Union[str, List[str], None]) -> Dict[str, Value]:
+    """Keep extra mined columns in the HuggingFace schema so load_dataset can cast."""
+    record = _first_jsonl_record(datapath)
+    if not record or "hard_tail_assistant_token_index" not in record:
+        return {}
+    extras: Dict[str, Value] = {
+        "hard_tail_assistant_token_index": Value("int64"),
+    }
+    if "accepted_k" in record:
+        extras["accepted_k"] = Value("int64")
+    if "source_id" in record:
+        extras["source_id"] = Value("string")
+    return extras
+
+
+def apply_hard_tail_loss_window(
+    loss_mask: torch.Tensor,
+    hard_tail_assistant_token_index: Optional[int],
+    window: int = 16,
+) -> torch.Tensor:
+    """Keep loss only on the 16-token serving block around a mined hard tail.
+
+    ``hard_tail_assistant_token_index`` is the 0-based assistant-token index of
+    the serving anchor, or ``-1`` when the anchor is the last prompt token.
+    Counting assistant tokens (loss_mask==1) is stable across Gemma image-token
+    expansion because image tokens are not assistant labels.
+    """
+    if hard_tail_assistant_token_index is None:
+        return loss_mask
+    try:
+        if isinstance(hard_tail_assistant_token_index, float) and (
+            hard_tail_assistant_token_index != hard_tail_assistant_token_index
+        ):
+            return loss_mask
+        ht = int(hard_tail_assistant_token_index)
+    except (TypeError, ValueError):
+        return loss_mask
+
+    flat = loss_mask.view(-1)
+    assistant = (flat > 0.5).nonzero(as_tuple=False).view(-1)
+    if assistant.numel() == 0:
+        return torch.zeros_like(loss_mask)
+
+    if ht < 0:
+        start = int(assistant[0].item()) - 1
+    else:
+        if ht >= int(assistant.numel()):
+            return torch.zeros_like(loss_mask)
+        start = int(assistant[ht].item())
+    start = max(start, 0)
+    end = min(start + int(window), int(flat.numel()))
+    if end <= start:
+        return torch.zeros_like(loss_mask)
+
+    new_mask = torch.zeros_like(flat)
+    new_mask[start:end] = 1
+    return new_mask.view_as(loss_mask)
+
+
 @DatasetBuilderFactory.register("online", "LLM")
 class OnlineLLMDatasetBuilder(OnlineDatasetBuilder):
     def __init__(
@@ -160,6 +240,8 @@ class OnlineGemma4DatasetBuilder(OnlineLLMDatasetBuilder):
 
 @DatasetBuilderFactory.register("online", "VLM", "qwen2_5_vl")
 @DatasetBuilderFactory.register("online", "VLM", "qwen3_vl")
+@DatasetBuilderFactory.register("online", "VLM", "qwen3_5")
+@DatasetBuilderFactory.register("online", "VLM", "qwen3_5_moe")
 class OnlineVLMDatasetBuilder(OnlineDatasetBuilder):
     def __init__(
         self,
@@ -193,24 +275,24 @@ class OnlineVLMDatasetBuilder(OnlineDatasetBuilder):
     ) -> Dataset:
         try:
             # Load dataset
-            features = Features(
-                {
-                    "id": Value("string"),
-                    "conversations": [
-                        {
-                            "role": Value("string"),
-                            "content": [
-                                {
-                                    "type": Value("string"),
-                                    "text": Value("string"),
-                                    "image": Value("string"),
-                                    "video": Value("string"),
-                                }
-                            ],
-                        }
-                    ],
-                }
-            )
+            feature_dict = {
+                "id": Value("string"),
+                "conversations": [
+                    {
+                        "role": Value("string"),
+                        "content": [
+                            {
+                                "type": Value("string"),
+                                "text": Value("string"),
+                                "image": Value("string"),
+                                "video": Value("string"),
+                            }
+                        ],
+                    }
+                ],
+            }
+            feature_dict.update(_hard_tail_feature_fields(datapath))
+            features = Features(feature_dict)
             ds = load_dataset("json", data_files=datapath, features=features)
 
             # Conditionally shuffle dataset
@@ -280,10 +362,16 @@ class OnlineVLMDatasetBuilder(OnlineDatasetBuilder):
             "loss_mask": [],
             "image_paths": [],
         }
+        hard_tails = examples.get("hard_tail_assistant_token_index")
 
         for i in range(len(examples["id"])):
             try:
-                processed_example = self._process_single_conversation(examples["conversations"][i])
+                processed_example = self._process_single_conversation(
+                    examples["conversations"][i],
+                    hard_tail_assistant_token_index=(
+                        None if hard_tails is None else hard_tails[i]
+                    ),
+                )
 
                 if processed_example is not None:
                     for key in new_examples.keys():
@@ -357,7 +445,11 @@ class OnlineVLMDatasetBuilder(OnlineDatasetBuilder):
             img = load_image(image_source)
             return img.size
 
-    def _process_single_conversation(self, conversation_data: List[Dict]) -> Optional[Dict]:
+    def _process_single_conversation(
+        self,
+        conversation_data: List[Dict],
+        hard_tail_assistant_token_index: Optional[int] = None,
+    ) -> Optional[Dict]:
         if not conversation_data or not isinstance(conversation_data, list):
             return None
 
@@ -415,6 +507,7 @@ class OnlineVLMDatasetBuilder(OnlineDatasetBuilder):
                 messages,
                 tokenize=False,
                 add_generation_prompt=False,
+                enable_thinking=False,
             )
 
             # Step 2 & 3: If images exist, get dimensions and compute token count per image
@@ -467,6 +560,10 @@ class OnlineVLMDatasetBuilder(OnlineDatasetBuilder):
                 rank0_print(f"Error creating loss mask: {e}")
                 rank0_print(f"offsets: {offsets}")
                 raise e
+            loss_mask = apply_hard_tail_loss_window(
+                loss_mask,
+                hard_tail_assistant_token_index,
+            )
             attention_mask = torch.ones_like(input_ids)
 
             # Visualize loss mask if display mode is enabled
@@ -490,6 +587,158 @@ class OnlineVLMDatasetBuilder(OnlineDatasetBuilder):
 
         except Exception as e:
             rank0_print(f"Error processing conversation: {e}")
+            return None
+
+
+@DatasetBuilderFactory.register("online", "VLM", "gemma4")
+class OnlineGemma4VLMDatasetBuilder(OnlineVLMDatasetBuilder):
+    """Gemma-4 VLM builder that preserves one image placeholder per image.
+
+    Unlike Qwen-VL, Gemma-4's image processor does not expose
+    ``get_number_of_image_patches``. vLLM expands the native ``<|image|>``
+    placeholder when it processes the raw image, and the hidden-state cache
+    generator subsequently expands ``input_ids`` and ``loss_mask`` to the
+    returned sequence length.
+    """
+
+    def get_data_collator(self) -> Any:
+        # Gemma4ImageProcessor rejects the Qwen-style min_pixels/max_pixels
+        # controls and applies its own fixed resize/crop contract.
+        return VLMDataCollatorWithPadding(
+            processor=self.tokenizer,
+            image_processor_kwargs={"min_pixels": None, "max_pixels": None},
+        )
+
+    def _preprocess_function(self, examples: Dict[str, List]) -> Dict[str, List]:
+        new_examples = {
+            "input_ids": [],
+            "attention_mask": [],
+            "loss_mask": [],
+            "image_paths": [],
+        }
+        hard_tails = examples.get("hard_tail_assistant_token_index")
+
+        for i in range(len(examples["id"])):
+            try:
+                hard_tail = None if hard_tails is None else hard_tails[i]
+                processed_example = self._process_single_conversation(
+                    examples["conversations"][i],
+                    hard_tail_assistant_token_index=hard_tail,
+                )
+
+                if processed_example is not None:
+                    for key in new_examples.keys():
+                        if key not in processed_example:
+                            new_examples[key].append(None)
+                        else:
+                            new_examples[key].append(processed_example[key])
+
+            except Exception as e:
+                rank0_print(f"Error processing Gemma-4 example: {e}")
+                for key in new_examples:
+                    new_examples[key].append(None)
+
+        cleaned_new_examples = {}
+        for key, value in new_examples.items():
+            if any(v is not None for v in value):
+                cleaned_new_examples[key] = value
+
+        return cleaned_new_examples
+
+    def _process_single_conversation(
+        self,
+        conversation_data: List[Dict],
+        hard_tail_assistant_token_index: Optional[int] = None,
+    ) -> Optional[Dict]:
+        if not conversation_data or not isinstance(conversation_data, list):
+            return None
+
+        try:
+            messages = []
+            image_paths = []
+            assistant_texts = []
+            for message in conversation_data:
+                role = message.get("role")
+                if role not in {"system", "user", "assistant"}:
+                    continue
+                raw_content = message.get("content", "")
+                if isinstance(raw_content, str):
+                    content = raw_content
+                    text = raw_content
+                else:
+                    content = []
+                    text_parts = []
+                    for item in raw_content or []:
+                        if not isinstance(item, dict):
+                            continue
+                        if item.get("type") == "image" and item.get("image"):
+                            image_path = item["image"]
+                            image_paths.append(image_path)
+                            content.append({"type": "image", "image": image_path})
+                        elif item.get("type") == "text":
+                            item_text = item.get("text", "")
+                            text_parts.append(item_text)
+                            content.append({"type": "text", "text": item_text})
+                    text = "".join(text_parts)
+                if content:
+                    messages.append({"role": role, "content": content})
+                    if role == "assistant" and text:
+                        assistant_texts.append(text)
+
+            if not messages or not assistant_texts:
+                return None
+
+            rendered = self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=False,
+            )
+            tokenizer = getattr(self.tokenizer, "tokenizer", self.tokenizer)
+            encoding = tokenizer(
+                rendered,
+                return_tensors="pt",
+                return_offsets_mapping=True,
+                max_length=self.max_length,
+                truncation=True,
+                padding=False,
+                add_special_tokens=False,
+            )
+            input_ids = encoding["input_ids"]
+            offsets = encoding["offset_mapping"][0]
+            loss_mask = torch.zeros_like(input_ids)
+
+            search_start = 0
+            assistant_spans = []
+            for text in assistant_texts:
+                start = rendered.find(text, search_start)
+                if start < 0:
+                    raise ValueError(
+                        "Assistant content was not found in rendered Gemma template"
+                    )
+                end = start + len(text)
+                assistant_spans.append((start, end))
+                search_start = end
+
+            for token_index, (token_start, token_end) in enumerate(offsets.tolist()):
+                if any(
+                    token_end > span_start and token_start < span_end
+                    for span_start, span_end in assistant_spans
+                ):
+                    loss_mask[0, token_index] = 1
+
+            loss_mask = apply_hard_tail_loss_window(
+                loss_mask,
+                hard_tail_assistant_token_index,
+            )
+
+            return {
+                "input_ids": input_ids.view(1, -1),
+                "attention_mask": torch.ones_like(input_ids).view(1, -1),
+                "loss_mask": loss_mask.view(1, -1),
+                "image_paths": json.dumps(image_paths),
+            }
+        except Exception as e:
+            rank0_print(f"Error processing Gemma-4 VLM conversation: {e}")
             return None
 
 

@@ -30,7 +30,32 @@ __all__ = [
     "AudioDataCollatorWithPadding",
     "CosyVoice3DataCollatorWithPadding",
     "build_image_processor_kwargs",
+    "build_qwen_vl_mm_token_type_ids",
 ]
+
+
+def build_qwen_vl_mm_token_type_ids(
+    input_ids: torch.Tensor,
+    processor,
+) -> torch.Tensor:
+    """Image-pad region between <|vision_start|> and <|vision_end|> (Qwen3-VL)."""
+    tokenizer = getattr(processor, "tokenizer", processor)
+    vision_start = tokenizer.convert_tokens_to_ids("<|vision_start|>")
+    vision_end = tokenizer.convert_tokens_to_ids("<|vision_end|>")
+    mm = torch.zeros_like(input_ids)
+    if vision_start is None or vision_end is None:
+        return mm
+    for batch_idx in range(input_ids.shape[0]):
+        seq = input_ids[batch_idx]
+        starts = (seq == vision_start).nonzero(as_tuple=False).view(-1)
+        ends = (seq == vision_end).nonzero(as_tuple=False).view(-1)
+        pair_count = min(len(starts), len(ends))
+        for idx in range(pair_count):
+            start = int(starts[idx].item())
+            end = int(ends[idx].item())
+            if end > start + 1:
+                mm[batch_idx, start + 1 : end] = 1
+    return mm
 
 
 def build_image_processor_kwargs(image_processor, max_pixels=None, min_pixels=None):
@@ -194,7 +219,7 @@ def paddingtensor3D_BCN(tensor_list):
     return torch.cat(out_tensor_list, dim=0)
 
 
-def paddingtensor3D_BHW(tensor_list):
+def paddingtensor3D_BHW(tensor_list, pad_value=0):
     if all(tensor is None for tensor in tensor_list):
         return None
     max_h = max(tensor.shape[-2] for tensor in tensor_list if tensor is not None)
@@ -204,7 +229,11 @@ def paddingtensor3D_BHW(tensor_list):
         if tensor.ndim == 2:
             tensor = tensor.unsqueeze(0)
         b, h, w = tensor.shape
-        outtensor = torch.zeros(b, max_h, max_w, dtype=tensor.dtype)
+        outtensor = torch.full(
+            (b, max_h, max_w),
+            pad_value,
+            dtype=tensor.dtype,
+        )
         if tensor is not None:
             outtensor[:, :h, :w] = tensor
         out_tensor_list.append(outtensor)
@@ -275,6 +304,66 @@ class VLMDataCollatorWithPadding:
         rank0_print(f"_resolved_image_processor_kwargs: {self._resolved_image_processor_kwargs}")
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
+        vision_encodings = None
+        raw_images = None
+        if self.processor is not None and "image_paths" in features[0]:
+            prepared_features = []
+            vision_encodings = []
+            raw_images = []
+            image_token_id = getattr(self.processor, "image_token_id", None)
+            if image_token_id is None and hasattr(self.processor, "tokenizer"):
+                image_token_id = self.processor.tokenizer.convert_tokens_to_ids(
+                    "<|image|>"
+                )
+            for item in features:
+                prepared = dict(item)
+                image_paths = json.loads(item["image_paths"])
+                vision_enc = None
+                if image_paths:
+                    images = [load_image(path) for path in image_paths]
+                    raw_images.append(images)
+                    if hasattr(self.processor, "image_processor"):
+                        vision_enc = self.processor.image_processor(
+                            images=images,
+                            return_tensors="pt",
+                            **self._resolved_image_processor_kwargs,
+                        )
+                    else:
+                        vision_enc = self.processor(
+                            images=images,
+                            return_tensors="pt",
+                            **self._resolved_image_processor_kwargs,
+                        )
+
+                    # Gemma-4 emits one textual image marker but its vision
+                    # tower returns one model token per soft visual token.
+                    soft_counts = vision_enc.get("num_soft_tokens_per_image")
+                    if soft_counts is not None and image_token_id is not None:
+                        counts = [int(value) for value in soft_counts.view(-1)]
+                        input_ids = prepared["input_ids"].view(-1)
+                        repeats = torch.ones_like(input_ids)
+                        image_positions = (input_ids == int(image_token_id)).nonzero(
+                            as_tuple=False
+                        ).view(-1)
+                        if len(image_positions) != len(counts):
+                            raise ValueError(
+                                "Gemma image token/image count mismatch: "
+                                f"{len(image_positions)} tokens for {len(counts)} images"
+                            )
+                        for position, count in zip(image_positions, counts):
+                            repeats[position] = count
+                        for key in ("input_ids", "attention_mask", "loss_mask"):
+                            source = prepared[key].view(-1)
+                            prepared[key] = torch.repeat_interleave(
+                                source,
+                                repeats,
+                            ).view(1, -1)
+                else:
+                    raw_images.append([])
+                prepared_features.append(prepared)
+                vision_encodings.append(vision_enc)
+            features = prepared_features
+
         max_length = max(item["input_ids"].shape[1] for item in features)
         batch_input_ids = torch.cat(
             [paddingtensor2D(item["input_ids"], max_length) for item in features]
@@ -295,30 +384,23 @@ class VLMDataCollatorWithPadding:
             "inputs_embeds": None,
             "position_ids": None,
         }
+        if raw_images is not None:
+            batch["raw_images"] = raw_images
 
         # Online training: decode image_paths -> pixel_values on-the-fly
         if self.processor is not None and "image_paths" in features[0]:
-            all_pixel_values, all_image_grid_thw = [], []
+            all_pixel_values, all_image_grid_thw, all_image_position_ids = [], [], []
             all_pixel_values_videos, all_video_grid_thw = [], []
-            for item in features:
-                image_paths = json.loads(item["image_paths"])
-                if image_paths:
-                    images = [load_image(p) for p in image_paths]
-                    if hasattr(self.processor, "image_processor"):
-                        vision_enc = self.processor.image_processor(
-                            images=images,
-                            return_tensors="pt",
-                            **self._resolved_image_processor_kwargs,
-                        )
-                    else:
-                        vision_enc = self.processor(
-                            images=images,
-                            return_tensors="pt",
-                            **self._resolved_image_processor_kwargs,
-                        )
+            assert vision_encodings is not None
+            for vision_enc in vision_encodings:
+                if vision_enc is not None:
                     all_pixel_values.append(vision_enc["pixel_values"])
                     if "image_grid_thw" in vision_enc:
                         all_image_grid_thw.append(vision_enc["image_grid_thw"])
+                    if "image_position_ids" in vision_enc:
+                        all_image_position_ids.append(
+                            vision_enc["image_position_ids"]
+                        )
                     if "pixel_values_videos" in vision_enc:
                         all_pixel_values_videos.append(vision_enc["pixel_values_videos"])
                     if "video_grid_thw" in vision_enc:
@@ -327,10 +409,21 @@ class VLMDataCollatorWithPadding:
                 batch["pixel_values"] = paddingtensor3D_BHW(all_pixel_values)
             if all_image_grid_thw:
                 batch["image_grid_thw"] = torch.cat(all_image_grid_thw, dim=0)
+            if all_image_position_ids:
+                batch["image_position_ids"] = paddingtensor3D_BHW(
+                    all_image_position_ids,
+                    pad_value=-1,
+                )
             if all_pixel_values_videos:
                 batch["pixel_values_videos"] = paddingtensor3D_BHW(all_pixel_values_videos)
             if all_video_grid_thw:
                 batch["video_grid_thw"] = torch.cat(all_video_grid_thw, dim=0)
+            if batch.get("image_grid_thw") is not None and self.processor is not None:
+                if "Qwen3" in type(self.processor).__name__:
+                    batch["mm_token_type_ids"] = build_qwen_vl_mm_token_type_ids(
+                        batch["input_ids"],
+                        self.processor,
+                    )
         else:
             if "pixel_values" in features[0]:
                 batch["pixel_values"] = paddingtensor3D_BHW(
@@ -346,6 +439,15 @@ class VLMDataCollatorWithPadding:
             ):
                 batch["image_grid_thw"] = torch.cat(
                     [item["image_grid_thw"] for item in features], dim=0
+                )
+            if all(
+                "image_position_ids" in item
+                and item["image_position_ids"] is not None
+                for item in features
+            ):
+                batch["image_position_ids"] = paddingtensor3D_BHW(
+                    [item["image_position_ids"] for item in features],
+                    pad_value=-1,
                 )
             if all(
                 "video_grid_thw" in item and item["video_grid_thw"] is not None

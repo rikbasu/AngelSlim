@@ -63,13 +63,52 @@ def sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
     return torch.multinomial(probs, num_samples=1).view(bsz, seq_len)
 
 
+def qwen_mrope_cos_sin(
+    position_ids: torch.Tensor,
+    head_dim: int,
+    theta: float,
+    partial_rotary_factor: float = 0.25,
+    mrope_section: Tuple[int, int, int] = (11, 11, 10),
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Interleaved Qwen M-RoPE. ``position_ids`` is ``(3, batch, seq)``."""
+    rotary_dim = int(head_dim * partial_rotary_factor)
+    rotary_dim -= rotary_dim % 2
+    inv_freq = 1.0 / (
+        theta
+        ** (
+            torch.arange(0, rotary_dim, 2, device=position_ids.device, dtype=torch.float32)
+            / rotary_dim
+        )
+    )
+    freqs = torch.einsum("cbs,d->cbsd", position_ids.float(), inv_freq)
+    channels = torch.arange(freqs.shape[-1], device=freqs.device)
+    is_height = (channels % 3 == 1) & (channels < mrope_section[1] * 3)
+    is_width = (channels % 3 == 2) & (channels < mrope_section[2] * 3)
+
+    def interleave(values: torch.Tensor) -> torch.Tensor:
+        mixed = torch.where(is_height, values[1], values[0])
+        return torch.where(is_width, values[2], mixed)
+
+    cos = interleave(freqs.cos())
+    sin = interleave(freqs.sin())
+    return torch.cat((cos, cos), dim=-1), torch.cat((sin, sin), dim=-1)
+
+
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
+
+    def rope(values, cos_values, sin_values):
+        rotary_dim = cos_values.size(-1)
+        if rotary_dim == values.size(-1):
+            return values * cos_values + rotate_half(values) * sin_values
+        rotated = values[..., :rotary_dim]
+        remainder = values[..., rotary_dim:]
+        rotated = rotated * cos_values + rotate_half(rotated) * sin_values
+        return torch.cat((rotated, remainder), dim=-1)
+
     q_len = q.size(-2)
-    q_embed = (q * cos[..., -q_len:, :]) + (rotate_half(q) * sin[..., -q_len:, :])
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
+    return rope(q, cos[..., -q_len:, :], sin[..., -q_len:, :]), rope(k, cos, sin)
 
 
 def build_target_layer_ids(num_target_layers: int, num_draft_layers: int) -> List[int]:
@@ -289,6 +328,10 @@ class QwenDFlareDraftModel(Qwen3PreTrainedModel):
         self.mask_token_id = dflash_config.get("mask_token_id", None)
         self.post_init()
 
+    def get_input_embeddings(self):
+        """DFlare receives target/noise embeddings from the trainer."""
+        return None
+
     def _init_fusion_weights(self) -> None:
         nn.init.constant_(self.layer_fusion_weights, 0.0)
         for d_idx in range(self.num_draft_layers):
@@ -309,6 +352,17 @@ class QwenDFlareDraftModel(Qwen3PreTrainedModel):
         **kwargs,
     ) -> torch.Tensor:
         hidden_states = noise_embedding
+        if isinstance(attention_mask, torch.Tensor) and attention_mask.dtype == torch.bool:
+            # HF eager attention adds the mask to the logits, so a boolean
+            # "may attend" mask must become 0 / -inf or it masks nothing.
+            additive = torch.zeros(
+                attention_mask.shape,
+                dtype=noise_embedding.dtype,
+                device=attention_mask.device,
+            )
+            attention_mask = additive.masked_fill(
+                ~attention_mask, torch.finfo(noise_embedding.dtype).min
+            )
         bsz, seq_len, _ = target_hidden.shape
         # target_hidden arrives as concatenation along feature dim of T target
         # layers' hidden states: [B, S, T*H]. Reshape to per-layer tensor.
@@ -319,7 +373,15 @@ class QwenDFlareDraftModel(Qwen3PreTrainedModel):
         # bsth (target) x dt (per-draft-layer fusion) -> bsdh (per-draft-layer)
         fused_hidden = torch.einsum("bsth,dt->bsdh", target_hidden_reshaped, fusion_probs)
         fused_hidden = self.hidden_norm(fused_hidden)
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        if position_ids.dim() == 3 and position_ids.shape[0] == 3:
+            rope_theta = float(getattr(self.config, "rope_theta", 10000000.0))
+            position_embeddings = qwen_mrope_cos_sin(
+                position_ids,
+                self.config.head_dim,
+                rope_theta,
+            )
+        else:
+            position_embeddings = self.rotary_emb(hidden_states, position_ids)
         for i, layer in enumerate(self.layers):
             layer_target_hidden = fused_hidden[:, :, i, :]
             hidden_states = layer(

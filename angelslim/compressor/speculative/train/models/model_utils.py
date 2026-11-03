@@ -144,6 +144,16 @@ MODEL_TYPE_PARAM_MAP: dict = {
         "model.language_model.embed_tokens.weight",
         "qwen3_vl",
     ),
+    "qwen3_5": (
+        "lm_head.weight",
+        "model.language_model.embed_tokens.weight",
+        "qwen3_vl",
+    ),
+    "qwen3_5_moe": (
+        "lm_head.weight",
+        "model.language_model.embed_tokens.weight",
+        "qwen3_vl",
+    ),
     "hunyuan_vl": (
         "model.embed_tokens.weight",
         "model.embed_tokens.weight",

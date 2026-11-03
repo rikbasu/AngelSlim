@@ -31,6 +31,7 @@
       39
     ],
     "mask_token_id": 4,
+    "rope_layout": "legacy",
     "target_model_type": "gemma4"
   },
   "attention_backend": "eager",

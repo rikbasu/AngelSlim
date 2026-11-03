@@ -237,16 +237,24 @@ def main():
 
     draft_vocab_size = None
     target_vocab_size = None
+    aux_hidden_states_layer_ids = None
     logger.info(f"args.draft_model_config_path: {args.draft_model_config_path}")
     if args.draft_model_config_path is not None:
         draft_config = DraftModelConfig.from_file(args.draft_model_config_path)
         draft_vocab_size = getattr(draft_config, "draft_vocab_size", None)
         target_vocab_size = getattr(draft_config, "vocab_size", None)
         args.target_model_type = getattr(draft_config, "target_model_type", None)
+        draft_method_config = (
+            getattr(draft_config, "dflash_config", None)
+            or getattr(draft_config, "dflare_config", None)
+            or {}
+        )
+        aux_hidden_states_layer_ids = draft_method_config.get("target_layer_ids")
         logger.info(
             f"Read from draft model config: draft_vocab_size={draft_vocab_size}, "
             f"target_vocab_size={target_vocab_size}, "
-            f"target_model_type={args.target_model_type}"
+            f"target_model_type={args.target_model_type}, "
+            f"target_layer_ids={aux_hidden_states_layer_ids}"
         )
     else:
         raise ValueError("--draft_model_config_path must be specified")
@@ -386,6 +394,7 @@ def main():
             output_dir,
             draft_vocab_size,
             target_vocab_size,
+            aux_hidden_states_layer_ids,
             limit_mm_per_prompt=None,
         ):
             self.worker_id = worker_id
@@ -394,6 +403,7 @@ def main():
             self.output_dir = output_dir
             self.draft_vocab_size = draft_vocab_size
             self.target_vocab_size = target_vocab_size
+            self.aux_hidden_states_layer_ids = aux_hidden_states_layer_ids
 
             # Inside Ray actor:
             #   - No RANK/WORLD_SIZE or other torchrun environment variables
@@ -475,6 +485,7 @@ def main():
                 rank=self.worker_id,
                 draft_vocab_size=self.draft_vocab_size,
                 target_vocab_size=self.target_vocab_size,
+                aux_hidden_states_layer_ids=self.aux_hidden_states_layer_ids,
             )
             successful, failed = generator.generate(dataset_slice)
 
@@ -511,6 +522,7 @@ def main():
             output_dir=args.outdir,
             draft_vocab_size=draft_vocab_size,
             target_vocab_size=target_vocab_size,
+            aux_hidden_states_layer_ids=aux_hidden_states_layer_ids,
             limit_mm_per_prompt=limit_mm_per_prompt,
         )
         workers.append(worker)

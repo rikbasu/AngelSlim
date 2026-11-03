@@ -23,6 +23,25 @@ import os
 from pathlib import Path
 
 import torch
+
+# Some ROCm training images provide torchvision's Python image transforms
+# without its optional detection operators. Transformers imports the fake NMS
+# registrations eagerly, so declare their schemas before importing Transformers.
+_torchvision_schema_library = None
+if os.environ.get("ANGELSLIM_SKIP_TORCHVISION_SCHEMA") != "1":
+    try:
+        getattr(torch.ops.torchvision, "nms")
+    except AttributeError:
+        _torchvision_schema_library = torch.library.Library(
+            "torchvision", "FRAGMENT"
+        )
+        _torchvision_schema_library.define(
+            "nms(Tensor boxes, Tensor scores, float iou_threshold) -> Tensor"
+        )
+        _torchvision_schema_library.define(
+            "qnms(Tensor boxes, Tensor scores, float iou_threshold) -> Tensor"
+        )
+
 import transformers
 
 from angelslim.compressor.speculative import (
@@ -71,8 +90,55 @@ def parse_args():
         "--target_backend",
         type=str,
         default="hf",
-        choices=["hf"],
-        help="Target model backend: hf (HuggingFace Transformers)",
+        choices=["hf", "vllm"],
+        help="Target model backend used to generate training hidden states.",
+    )
+    model_group.add_argument(
+        "--allow_distributed_vllm_target",
+        action="store_true",
+        help=(
+            "Allow WORLD_SIZE>1 only when an external launcher pins one physical "
+            "GPU per rank and sets LOCAL_RANK=0 in every process."
+        ),
+    )
+    model_group.add_argument(
+        "--draft_model_name_or_path",
+        type=str,
+        default=None,
+        help="Optional draft checkpoint used to initialize fine-tuning.",
+    )
+    model_group.add_argument(
+        "--front_teacher_draft_path",
+        type=str,
+        default=None,
+        help="Frozen B16 AngelSlim checkpoint used for front-logit distillation.",
+    )
+    model_group.add_argument("--front_teacher_block_size", type=int, default=16)
+    model_group.add_argument("--front_distill_positions", type=int, default=15)
+    model_group.add_argument("--front_distill_weight", type=float, default=0.0)
+    model_group.add_argument("--front_distill_temperature", type=float, default=1.0)
+    model_group.add_argument(
+        "--train_tail_adapters_only",
+        action="store_true",
+        help="Freeze the DFlare backbone and optimize only tail_adapter_* parameters.",
+    )
+    model_group.add_argument(
+        "--gpu_memory_utilization",
+        type=float,
+        default=0.5,
+        help="vLLM target-engine GPU memory utilization.",
+    )
+    model_group.add_argument(
+        "--max_num_seqs",
+        type=int,
+        default=1,
+        help="Maximum concurrent target-engine sequences.",
+    )
+    model_group.add_argument(
+        "--target_max_images",
+        type=int,
+        default=0,
+        help="Maximum images per vLLM teacher request (0 keeps text-only mode).",
     )
     model_group.add_argument(
         "--torch_dtype",
@@ -130,6 +196,47 @@ def parse_args():
         ),
     )
     dflash_group.add_argument(
+        "--max_train_positions",
+        type=int,
+        default=None,
+        help="Restrict DFlare CE supervision to the first N predicted positions.",
+    )
+    dflash_group.add_argument(
+        "--ar_aux_weight",
+        type=float,
+        default=0.0,
+        help="Weight for causal in-block teacher-forced auxiliary supervision.",
+    )
+    dflash_group.add_argument(
+        "--acceptance_aware_loss",
+        action="store_true",
+        help=(
+            "Use D-PACE dynamic token-CE weights derived from expected "
+            "accepted-prefix length."
+        ),
+    )
+    dflash_group.add_argument(
+        "--dpace_alpha",
+        type=float,
+        default=None,
+        help=(
+            "D-PACE confidence-smoothing coefficient in [0, 1]. "
+            "Defaults to 0.5 when --acceptance_aware_loss is enabled."
+        ),
+    )
+    dflash_group.add_argument(
+        "--horizon_boundary",
+        type=int,
+        default=None,
+        help="First block offset receiving the DBloom horizon-tail loss weight.",
+    )
+    dflash_group.add_argument(
+        "--horizon_tail_weight",
+        type=float,
+        default=None,
+        help="Cross-entropy multiplier at and beyond --horizon_boundary.",
+    )
+    dflash_group.add_argument(
         "--attention_backend",
         type=str,
         default="flex_attention",
@@ -151,6 +258,15 @@ def parse_args():
         nargs="+",
         required=True,
         help="Path to training data file(s) (JSON format). Can specify multiple files.",
+    )
+    data_group.add_argument(
+        "--dataset_modal_type",
+        choices=["LLM", "VLM"],
+        default="LLM",
+        help=(
+            "Dataset/collator modality. Use VLM to preserve and process image "
+            "content during online DFlare training."
+        ),
     )
     data_group.add_argument(
         "--eval_data_path",
@@ -244,6 +360,12 @@ def parse_args():
         type=int,
         default=6,
         help="Total number of training epochs to perform",
+    )
+    training_group.add_argument(
+        "--max_steps",
+        type=int,
+        default=-1,
+        help="If > 0, stop after this many optimizer steps instead of finishing all epochs",
     )
     training_group.add_argument(
         "--learning_rate", type=float, default=6e-4, help="Initial learning rate"
@@ -400,6 +522,9 @@ def _setup_wandb(args) -> None:
 
 def train():
     args = parse_args()
+    local_rank = int(os.environ.get("LOCAL_RANK", "-1"))
+    if local_rank >= 0 and torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
     _setup_wandb(args)
 
     # Parse torch dtype
@@ -448,6 +573,25 @@ def train():
         draft_model_config.num_anchors = args.num_anchors
     if args.loss_decay_gamma is not None:
         draft_model_config.loss_decay_gamma = args.loss_decay_gamma
+    draft_model_config.max_train_positions = args.max_train_positions
+    draft_model_config.ar_aux_weight = args.ar_aux_weight
+    if args.acceptance_aware_loss:
+        draft_model_config.acceptance_aware_loss = True
+    if args.dpace_alpha is not None:
+        if not 0.0 <= args.dpace_alpha <= 1.0:
+            raise ValueError(
+                f"--dpace_alpha must be in [0, 1], got {args.dpace_alpha}"
+            )
+        draft_model_config.dpace_alpha = args.dpace_alpha
+    if args.horizon_boundary is not None:
+        draft_model_config.horizon_boundary = args.horizon_boundary
+    if args.horizon_tail_weight is not None:
+        draft_model_config.horizon_tail_weight = args.horizon_tail_weight
+    draft_model_config.front_teacher_block_size = args.front_teacher_block_size
+    draft_model_config.front_distill_positions = args.front_distill_positions
+    draft_model_config.front_distill_weight = args.front_distill_weight
+    draft_model_config.front_distill_temperature = args.front_distill_temperature
+    draft_model_config.train_tail_adapters_only = args.train_tail_adapters_only
     # Always propagate gamma_warmup flags to the draft model config so the
     # trainer can pick them up regardless of CLI defaults.
     draft_model_config.gamma_warmup = args.gamma_warmup
@@ -465,19 +609,47 @@ def train():
     # Set attention implementation
     draft_model_config._attn_implementation = args.attention_backend
 
+    if (
+        args.target_backend == "vllm"
+        and int(os.environ.get("WORLD_SIZE", "1")) > 1
+        and not args.allow_distributed_vllm_target
+    ):
+        raise ValueError(
+            "vLLM-targeted online training currently supports one trainer process. "
+            "Do not launch it with torchrun."
+        )
+
     # Create target model with specified backend
     rank0_print(f"Loading target model with {args.target_backend} backend...")
+    target_extra_kwargs = {}
+    if args.target_backend == "vllm":
+        target_extra_kwargs = {
+            "max_model_len": args.model_max_length + 1,
+            "gpu_memory_utilization": args.gpu_memory_utilization,
+            "enforce_eager": True,
+            "max_num_seqs": args.max_num_seqs,
+            "limit_mm_per_prompt": {
+                "image": args.target_max_images,
+                "video": 0,
+            },
+        }
     target_model = create_target_model(
         backend=args.target_backend,
         model_path=args.target_model_name_or_path,
         modal_type=(
             "Gemma4"
-            if target_model_type == "gemma4"
-            else "LLM"
+            if args.target_backend == "hf" and target_model_type == "gemma4"
+            else (
+                "VLM"
+                if args.target_backend == "vllm"
+                or args.dataset_modal_type == "VLM"
+                else "LLM"
+            )
         ),
         torch_dtype=torch_dtype,
         trust_remote_code=args.trust_remote_code,
         target_model_type=target_model_type,
+        **target_extra_kwargs,
     )
     rank0_print("Target model loaded successfully")
 
@@ -497,17 +669,60 @@ def train():
     rank0_print("Loading draft model...")
     rank0_print(f"draft_model_config: {draft_model_config}")
     draft_model = create_draft_model(draft_model_config)
+    if args.draft_model_name_or_path is not None:
+        from safetensors.torch import load_file
+
+        checkpoint_path = Path(args.draft_model_name_or_path)
+        weights_path = checkpoint_path / "model.safetensors"
+        if not weights_path.is_file():
+            raise FileNotFoundError(
+                f"Expected an unsharded draft checkpoint at {weights_path}"
+            )
+        load_result = draft_model.load_state_dict(
+            load_file(weights_path, device="cpu"),
+            strict=True,
+        )
+        rank0_print(
+            f"Initialized draft from {checkpoint_path}: "
+            f"missing={len(load_result.missing_keys)}, "
+            f"unexpected={len(load_result.unexpected_keys)}"
+        )
     rank0_print("Draft model loaded successfully")
     rank0_print(f"Draft model parameters: {sum(p.numel() for p in draft_model.parameters()):,}")
+    front_teacher_model = None
+    if args.front_teacher_draft_path is not None:
+        from safetensors.torch import load_file
+
+        teacher_path = Path(args.front_teacher_draft_path)
+        teacher_config = DraftModelConfig.from_file(teacher_path / "config.json")
+        if args.attention_backend is not None:
+            teacher_config.attention_backend = args.attention_backend
+            teacher_config._attn_implementation = args.attention_backend
+        front_teacher_model = create_draft_model(teacher_config)
+        teacher_weights = teacher_path / "model.safetensors"
+        if not teacher_weights.is_file():
+            raise FileNotFoundError(
+                f"Expected an unsharded front teacher at {teacher_weights}"
+            )
+        front_teacher_model.load_state_dict(
+            load_file(teacher_weights, device="cpu"),
+            strict=True,
+        )
+        front_teacher_model.eval()
+        front_teacher_model.requires_grad_(False)
+        rank0_print(
+            "Loaded frozen front teacher from "
+            f"{teacher_path} at B{teacher_config.block_size}"
+        )
 
     # Create datasets using DatasetManager
     rank0_print(
         "Creating training and evaluation datasets "
         f"with chat template type: {args.chat_template_type}..."
     )
-    # DatasetBuilderFactory doesn't know "DFlash"; DFlash uses the same data
-    # format as "LLM", so temporarily override modal_type for dataset creation.
-    args.modal_type = "LLM"
+    # The trainer is registered as DFlash, while dataset builders are registered
+    # as LLM/VLM. Preserve VLM here so image paths reach the multimodal collator.
+    args.modal_type = args.dataset_modal_type
     dataset_manager = DatasetManager(
         data_args=args,
         tokenizer=target_model.tokenizer,
@@ -527,6 +742,7 @@ def train():
     basic_args = {
         "output_dir": args.output_dir,
         "num_train_epochs": args.num_train_epochs,
+        "max_steps": args.max_steps,
     }
 
     batch_args = {
@@ -595,6 +811,7 @@ def train():
         target_model=target_model,
         length=args.training_time_test_length,
         draft_model_config=draft_model_config,
+        front_teacher_model=front_teacher_model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
