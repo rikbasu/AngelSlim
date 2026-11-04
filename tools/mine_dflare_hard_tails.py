@@ -249,15 +249,15 @@ class DraftBlockScorer:
                 causal_within_block=False,
                 attention_backend=self.attention_backend,
             )
-            # Training runs the draft under bf16 autocast; Qwen M-RoPE cos/sin
-            # are float32 and only mix with bf16 activations inside autocast.
-            with torch.autocast("cuda", dtype=model_dtype):
-                output_hidden = self.model(
-                    noise_embedding=noise_embedding.to(model_dtype),
-                    target_hidden=hidden_states.to(model_dtype),
-                    attention_mask=attn_mask,
-                    position_ids=full_position_ids,
-                )
+            # The draft runs entirely in float32. With bf16 weights or bf16
+            # autocast the Gemma draft's block positions collapse (repeated
+            # tokens) and the walk accepts almost nothing.
+            output_hidden = self.model(
+                noise_embedding=noise_embedding.to(model_dtype),
+                target_hidden=hidden_states.to(model_dtype),
+                attention_mask=attn_mask,
+                position_ids=full_position_ids,
+            )
             logits = self.target_lm_head(
                 output_hidden.to(self.target_lm_head.weight.dtype)
             )
@@ -459,7 +459,8 @@ def main() -> None:
         f"Loaded draft weights missing={len(load_result.missing_keys)} "
         f"unexpected={len(load_result.unexpected_keys)}"
     )
-    draft_model.to(device=device, dtype=torch_dtype)
+    # float32 draft; see DraftBlockScorer.accepted_prefix_lengths.
+    draft_model.to(device=device, dtype=torch.float32)
     draft_model.eval()
     draft_model.requires_grad_(False)
 
