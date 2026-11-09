@@ -280,6 +280,10 @@ class TargetEmbeddingsAndHead(nn.Module):
             if not tie_weights:
                 if lm_head_key in weight_map:
                     files_to_load[lm_head_key] = weight_map[lm_head_key]
+                else:
+                    # A missing head would leave a random nn.Linear that the draft then
+                    # trains against; set lm_head_key in the draft config instead.
+                    raise ValueError(f"LM head key '{lm_head_key}' not found in weight map.")
         else:
             safetensors = glob.glob(os.path.join(model_path, "*.safetensors"))
             bins = glob.glob(os.path.join(model_path, "*.bin"))
@@ -331,8 +335,12 @@ class TargetEmbeddingsAndHead(nn.Module):
             if k == target_embed_key:
                 self.embed_tokens.weight.data.copy_(tensor)
             elif k == target_head_key:
-                if tensor.shape == self.lm_head.weight.data.shape:
-                    self.lm_head.weight.data.copy_(tensor)
+                if tensor.shape != self.lm_head.weight.data.shape:
+                    raise ValueError(
+                        f"LM head '{k}' has shape {tuple(tensor.shape)}, "
+                        f"expected {tuple(self.lm_head.weight.shape)}"
+                    )
+                self.lm_head.weight.data.copy_(tensor)
 
 
 class _FP32StateAdamW(torch.optim.Optimizer):

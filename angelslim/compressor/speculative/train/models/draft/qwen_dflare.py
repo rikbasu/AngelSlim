@@ -374,11 +374,19 @@ class QwenDFlareDraftModel(Qwen3PreTrainedModel):
         fused_hidden = torch.einsum("bsth,dt->bsdh", target_hidden_reshaped, fusion_probs)
         fused_hidden = self.hidden_norm(fused_hidden)
         if position_ids.dim() == 3 and position_ids.shape[0] == 3:
-            rope_theta = float(getattr(self.config, "rope_theta", 10000000.0))
+            # vLLM serves the draft with the target's M-RoPE layout; defaults are Qwen3.6's.
+            # Transformers 5 keeps rope_theta / partial_rotary_factor only in rope_parameters.
+            rope = getattr(self.config, "rope_parameters", None) or {}
+            rope_theta = float(rope.get("rope_theta", getattr(self.config, "rope_theta", 1e7)))
+            partial = rope.get(
+                "partial_rotary_factor", getattr(self.config, "partial_rotary_factor", 0.25)
+            )
             position_embeddings = qwen_mrope_cos_sin(
                 position_ids,
                 self.config.head_dim,
                 rope_theta,
+                partial_rotary_factor=float(partial),
+                mrope_section=tuple(getattr(self.config, "mrope_section", None) or (11, 11, 10)),
             )
         else:
             position_embeddings = self.rotary_emb(hidden_states, position_ids)
